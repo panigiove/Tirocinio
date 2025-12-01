@@ -3,3 +3,8 @@
 /video raw
 /Results
 *.pt
+/output_meshes
+/output
+/.idea
+*.jpg
+/sapiens
