@@ -5,7 +5,8 @@ from ultralytics import YOLO
 
 # Import SAHI components
 from sahi.predict import get_sliced_prediction
-from sahi.model import get_model_from_name
+from sahi import AutoDetectionModel
+from iou_tracker import IOUTracker # Import our new tracker
 
 avg_fps = []
 video_writer = None
@@ -13,10 +14,14 @@ video_writer = None
 # Parametri della maschera trapezoidale con base curva
 # Facilmente regolabili per adattarsi alla propria scena
 TRAPEZOID_TOP_LEFT = (210, 380)      # Angolo superiore sinistro
-TRAPEZOID_TOP_RIGHT = (1240, 350)    # Angolo superiore destro
-TRAPEZOID_BOTTOM_LEFT = (0, 665)     # Angolo inferiore sinistro
-TRAPEZOID_BOTTOM_RIGHT = (1440, 665) # Angolo inferiore destro
+TRAPEZ_TOP_RIGHT = (1240, 350)    # Angolo superiore destro
+TRAPEZ_BOTTOM_LEFT = (0, 665)     # Angolo inferiore sinistro
+TRAPEZ_BOTTOM_RIGHT = (1440, 665) # Angolo inferiore destro
 CURVE_HEIGHT = 65                   # Altezza della curva della base (0 = retta, più alto = più curva)
+
+# Helper function to round up to the nearest multiple of 'multiple'
+def round_to_multiple(value, multiple):
+    return multiple * ((value + multiple - 1) // multiple)
 
 def draw_text_with_bg(img, text, pos, font_scale=0.6, text_color=(255, 255, 255), bg_color=(0, 0, 0)):
     font = cv.FONT_HERSHEY_SIMPLEX
@@ -79,7 +84,6 @@ def create_trapezoid_mask(frame_shape, tl, tr, bl, br, curve_height=0):
         # Base inferiore: curva da br a bl (con concavità verso il basso)
         for i in range(1, 20):
             t = i / 20.0
-            # Interpolazione parabolica sulla base inferiore
             x = br[0] + (bl[0] - br[0]) * t
             y = br[1] + (bl[1] - br[1]) * t + curve_height * (4 * t * (1 - t))  # Plus per curvatura verso il basso
             points_curve.append((int(x), int(y)))
@@ -103,34 +107,19 @@ def apply_trapezoid_mask(frame, mask):
 
 def draw_trapezoid_on_frame(frame, points, color=(0, 255, 0), thickness=2):
     """Disegna il contorno del trapezio sul frame"""
-    cv.polylines(frame, [points], isClosed=True, color=color, thickness=thickness)
+    cv.polylines(frame, [points], isClosed=True, color=color, thickness=2)
 
 
-def yolo_pose_tracking(source=0, size=(1440, 810)):
-    """ results = yolo_model.train(
-        data = "coco8-pose.yaml",
-        epochs = 100,
-        imgsz = 640,
-        batch = 16,
-        lr0 = 0.001,
-        lrf = 0.01,
-        momentum = 0.9,
-        weight_decay = 0.0005,
-        warmup_epochs = 5.0,
-        augment = False,
-        degrees = 10.0,
-        translate = 0.1,
-        scale = 0.2,
-        flipud = 0.0,
-        fliplr = 0.7,
-        mosaic = 0.0,
-        mixup = 1.0,
-        device = "cpu",
-        resume = False,
-        save_period = 5,
-        name = "pose_experiment",
-        exist_ok = True
-    ) """
+def yolo_pose_tracking(source=0, size=(1440, 810), conf_threshold=0.3, iou_threshold=0.7):
+    """ 
+    Performs YOLO-based pose tracking on video frames.
+    
+    Args:
+        source: video source (e.g., 0 for webcam, "path/to/video.mp4").
+        size: tuple (width, height) for resizing frames.
+        conf_threshold: confidence threshold for object detection.
+        iou_threshold: IOU threshold for non-maximum suppression (NMS).
+    """
 
     # YOLO connections
     connections = [
@@ -152,9 +141,9 @@ def yolo_pose_tracking(source=0, size=(1440, 810)):
     trap_mask, trap_points = create_trapezoid_mask(
         (size[1], size[0]),  # (height, width) - dimensioni ridimensionate
         TRAPEZOID_TOP_LEFT, 
-        TRAPEZOID_TOP_RIGHT, 
-        TRAPEZOID_BOTTOM_LEFT, 
-        TRAPEZOID_BOTTOM_RIGHT, 
+        TRAPEZ_TOP_RIGHT, 
+        TRAPEZ_BOTTOM_LEFT, 
+        TRAPEZ_BOTTOM_RIGHT, 
         curve_height=CURVE_HEIGHT
     )
     
@@ -183,20 +172,19 @@ def yolo_pose_tracking(source=0, size=(1440, 810)):
 
         # Applica la maschera trapezoidale al frame
         roi_frame = apply_trapezoid_mask(frame, trap_mask)
-        imgsz_roi = max(orig_width, orig_height)
+        
+        # Ensure imgsz_roi is a multiple of 32
+        imgsz_roi = round_to_multiple(max(orig_width, orig_height), 32)
 
         start_time = time.time()
         # Usa track() con parametri per tracking più consistente
-        # conf=0.005: confidence ragionevole per evitare troppi falsi positivi
-        # iou=0.25: IoU moderato per bilanciare rilevamenti e soppressioni
-        # max_det=300: numero massimo di rilevamenti per frame
         results = yolo_model.track(
             roi_frame,
             device='cuda',
             tracker='bytetrack.yaml',
             show=False,
-            conf=0.005,                    # Confidence leggermente più alto per stabilità
-            iou=0.25,                      # IoU moderato
+            conf=conf_threshold,           # Use parameter
+            iou=iou_threshold,             # Use parameter
             imgsz=imgsz_roi, 
             max_det=300,
             persist=True,                  # Mantieni gli ID tra i frame
@@ -278,10 +266,20 @@ def yolo_pose_tracking(source=0, size=(1440, 810)):
     cv.destroyAllWindows()
 
 
-def yolo_pose_predict(source=0, size=(1440, 810)):
-    """Versione senza tracking - usa predict() per massimizzare i rilevamenti"""
+def yolo_pose_predict(source=0, size=(1440, 810), sahi_conf_threshold=0.4, sahi_iou_threshold=0.7, pose_conf_threshold=0.5, pose_iou_threshold=0.7):
+    """
+    Versione con rilevamento di persone tramite SAHI e stima pose sulle ROI delle persone.
+    
+    Args:
+        source: video source (e.g., 0 for webcam, "path/to/video.mp4").
+        size: tuple (width, height) for resizing frames.
+        sahi_conf_threshold: confidence threshold for initial SAHI person detection.
+        sahi_iou_threshold: IOU threshold for SAHI's NMS.
+        pose_conf_threshold: confidence threshold for keypoints detection by the pose model.
+        pose_iou_threshold: IOU threshold for NMS in the pose model.
+    """
 
-    # YOLO connections
+    # YOLO connections for drawing keypoints
     connections = [
         (0, 1), (0, 2), (1, 3), (2, 4),
         (5, 6), (5, 7), (6, 8), (7, 9), (8, 10),
@@ -289,17 +287,19 @@ def yolo_pose_predict(source=0, size=(1440, 810)):
         (11, 13), (12, 14), (13, 15), (14, 16)
     ]
 
-    # Initialize YOLO model
-    yolo_model = YOLO("yolo11x-pose.pt")
-
-    # Initialize SAHI model
-    sahi_model = get_model_from_name(
-        model_type="yolov8",
-        model_path="yolo11x-pose.pt", # Use the same YOLO model for SAHI
-        confidence_threshold=0.25, # Lower confidence for more detections from SAHI
-        image_size=640, # Inference size for slices
+    # Initialize SAHI model for sliced detection (e.g., yolov8x.pt for general object detection)
+    # This model will detect 'person' objects.
+    sahi_detection_model = AutoDetectionModel.from_pretrained(
+        model_type="ultralytics",
+        model_path="yolov8x.pt", # Using a general detection model like YOLOv8x
+        confidence_threshold=sahi_conf_threshold, # Use parameter
+        image_size=round_to_multiple(640, 32), # Ensure image_size is a multiple of 32
         device="cuda:0" # Ensure it runs on GPU
     )
+
+    # Initialize a separate YOLO pose estimation model
+    # This model will be used on cropped regions to find keypoints.
+    pose_estimation_model = YOLO("yolo11x-pose.pt") 
 
     cap = cv.VideoCapture(source)
 
@@ -311,17 +311,11 @@ def yolo_pose_predict(source=0, size=(1440, 810)):
     trap_mask, trap_points = create_trapezoid_mask(
         (size[1], size[0]),  # (height, width) - dimensioni ridimensionate
         TRAPEZOID_TOP_LEFT, 
-        TRAPEZOID_TOP_RIGHT, 
-        TRAPEZOID_BOTTOM_LEFT, 
-        TRAPEZOID_BOTTOM_RIGHT, 
+        TRAPEZ_TOP_RIGHT, 
+        TRAPEZ_BOTTOM_LEFT, 
+        TRAPEZ_BOTTOM_RIGHT, 
         curve_height=CURVE_HEIGHT
     )
-    
-    # Calcola i bounds della maschera per il video writer
-    x_coords = trap_points[:, 0]
-    y_coords = trap_points[:, 1]
-    roi_width = int(np.max(x_coords) - np.min(x_coords))
-    roi_height = int(np.max(y_coords) - np.min(y_coords))
     
     # Inizializza video_writer UNA SOLA VOLTA con le dimensioni del frame ridimensionato
     video_writer = cv.VideoWriter("yolo-pose-predict-sahi.avi", cv.VideoWriter_fourcc(*"mp4v"), original_fps, (size[0], size[1]))
@@ -341,75 +335,128 @@ def yolo_pose_predict(source=0, size=(1440, 810)):
         frame_count += 1
 
         # Applica la maschera trapezoidale al frame
-        roi_frame = apply_trapezoid_mask(frame, trap_mask)
+        roi_frame_with_black = apply_trapezoid_mask(frame, trap_mask)
         
+        # Calculate bounding box of the non-black (trapezoid) region in roi_frame_with_black
+        y_nonzero, x_nonzero, _ = np.where(roi_frame_with_black > 0)
+        
+        cropped_roi_frame = np.zeros_like(frame) # Default to empty if no valid crop
+        min_x, min_y = 0, 0 # Default offsets
+
+        if y_nonzero.size > 0 and x_nonzero.size > 0:
+            min_y, max_y = np.min(y_nonzero), np.max(y_nonzero)
+            min_x, max_x = np.min(x_nonzero), np.max(x_nonzero)
+            
+            if max_y > min_y and max_x > min_x:
+                cropped_roi_frame = roi_frame_with_black[min_y:max_y+1, min_x:max_x+1].copy()
+            
         start_time = time.time()
         
-        # Use SAHI for sliced prediction on the ROI frame
-        sahi_results = get_sliced_prediction(
-            roi_frame,
-            sahi_model,
-            slice_height=640, # Height of each slice
-            slice_width=640,  # Width of each slice
-            overlap_height_ratio=0.2, # Overlap between slices
-            overlap_width_ratio=0.2,  # Overlap between slices
-            postprocess_type="NMS",   # NMS for merging overlapping detections
-            verbose=False,
-            device="cuda:0"
-        )
-        process_time = time.time() - start_time
-
-        # Initialize lists for keypoints and detections
-        keypoints_list = []
-        object_detections = sahi_results.object_prediction_list
-        num_detections = len(object_detections)
+        all_keypoints = []
         num_persons = 0
+        num_detections = 0
+        all_person_bboxes_on_full_frame = [] # New list to store adjusted bounding boxes
 
-        # Process SAHI results
-        for obj_pred in object_detections:
-            # Check if keypoints exist for the prediction
-            if obj_pred.keypoints is not None:
-                # Extract keypoints in the format expected by our drawing functions
-                kpts_data = np.array([[kp.x, kp.y, kp.score] for kp in obj_pred.keypoints.as_original_image_level]).astype(np.float32)
-                if len(kpts_data) > 0:
-                    keypoints_list.append(kpts_data)
-                    num_persons += 1
+        if cropped_roi_frame.size > 0 and np.any(cropped_roi_frame):
+            # Stage 1: Person detection using SAHI
+            # Filtering for 'person' class (class_id 0 in COCO for YOLOv8)
+            detection_results = get_sliced_prediction(
+                cropped_roi_frame,
+                sahi_detection_model,
+                slice_height=640,
+                slice_width=640,
+                overlap_height_ratio=0.2,
+                overlap_width_ratio=0.2,
+                postprocess_match_metric="IOU",
+                postprocess_match_threshold=sahi_iou_threshold, # Use parameter
+                # slice_conf_threshold=0.05, # Removed due to potential TypeError
+                verbose=0,
+            )
+            
+            person_boxes = []
+            if detection_results and detection_results.object_prediction_list:
+                for prediction in detection_results.object_prediction_list:
+                    # Assuming 'person' has class_id 0 in the model used for SAHI detection (e.g. COCO trained YOLOv8)
+                    if prediction.category.id == 0 and prediction.score.value > sahi_conf_threshold: # Filter for persons with reasonable confidence
+                        bbox = prediction.bbox.to_xyxy()
+                        # Adjust bbox to be relative to the original frame's coordinate system
+                        adjusted_bbox = (int(bbox[0] + min_x), int(bbox[1] + min_y), int(bbox[2] + min_x), int(bbox[3] + min_y))
+                        person_boxes.append((int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])))
+                        all_person_bboxes_on_full_frame.append(adjusted_bbox) # Store adjusted bbox
+            
+            num_detections = len(person_boxes)
+
+            # Stage 2: Pose estimation for each detected person
+            for person_bbox in person_boxes:
+                p_x1, p_y1, p_x2, p_y2 = person_bbox
+                
+                # Crop the person region from the cropped_roi_frame
+                person_crop = cropped_roi_frame[p_y1:p_y2, p_x1:p_x2]
+
+                if person_crop.size > 0 and np.any(person_crop):
+                    # Round up the image size for pose estimation to a multiple of 32
+                    pose_imgsz = round_to_multiple(max(person_crop.shape[:2]), 32)
+                    
+                    # Run pose estimation on the person crop
+                    pose_results = pose_estimation_model.predict(
+                        person_crop,
+                        conf=pose_conf_threshold, # Use parameter
+                        iou=pose_iou_threshold,   # Use parameter
+                        imgsz=pose_imgsz, # Use appropriate image size for pose model
+                        device='cuda',
+                        verbose=False
+                    )
+
+                    if pose_results and len(pose_results[0].keypoints.xy) > 0:
+                        # Extract keypoints and adjust their coordinates
+                        kpts = pose_results[0].keypoints.xy.cpu().numpy()[0]
+                        # Adjust keypoint coordinates from person_crop -> cropped_roi_frame -> original_frame
+                        adjusted_kpts = kpts + [min_x + p_x1, min_y + p_y1]
+                        all_keypoints.append(adjusted_kpts)
+                        num_persons += 1
+        
+        process_time = time.time() - start_time
 
         # Copia il frame originale per visualizzare
         output_frame = frame.copy()
-        roi_output = roi_frame.copy()
+        
+        # Initialize roi_output with the masked frame, not a black canvas
+        roi_output = roi_frame_with_black.copy()
+
+        # Draw bounding boxes for detected people first
+        for bbox_idx, bbox in enumerate(all_person_bboxes_on_full_frame):
+            x1, y1, x2, y2 = bbox
+            color_bbox = (0, 255, 255) # Cyan color for bounding box
+            cv.rectangle(roi_output, (x1, y1), (x2, y2), color_bbox, 2)
+            cv.putText(roi_output, f'Det: {bbox_idx}', (x1, y1 - 10), cv.FONT_HERSHEY_SIMPLEX, 0.7, color_bbox, 2)
+
 
         if num_persons > 0:
-            print(f"Rilevamenti: {num_detections} | Persone (con keypoints): {num_persons}")  # DEBUG
-
-            for person_idx, person_kpts in enumerate(keypoints_list):
-                # Colore diverso per ogni persona
+            for person_idx, person_kpts in enumerate(all_keypoints):
                 color_line = (int(50 * person_idx) % 256, int(100 * person_idx) % 256, int(150 * person_idx) % 256)
 
-                for start, end in connections:  # Draw connections
+                # Draw connections
+                for start, end in connections:
                     if start < len(person_kpts) and end < len(person_kpts):
                         pt1, pt2 = person_kpts[start], person_kpts[end]
                         if pt1[0] > 0 and pt1[1] > 0 and pt2[0] > 0 and pt2[1] > 0:
-                            # Disegna sulla ROI
                             cv.line(roi_output, (int(pt1[0]), int(pt1[1])),
                                      (int(pt2[0]), int(pt2[1])), color_line, 2)
 
-                for pt in person_kpts:  # Draw keypoints
+                # Draw keypoints
+                for pt in person_kpts:
                     if pt[0] > 0 and pt[1] > 0:
-                        # Disegna sulla ROI
                         cv.circle(roi_output, (int(pt[0]), int(pt[1])), 3, color_line, -1)
                         cv.circle(roi_output, (int(pt[0]), int(pt[1])), 3, (255, 255, 255), 1)
                 
-                # Disegna il numero della persona (index)
-                head_kpt = person_kpts[0]
+                # Draw person index
+                # Use keypoint 0 (nose) for text placement, or average if not available
+                head_kpt = person_kpts[0] if len(person_kpts) > 0 else (0,0)
                 if head_kpt[0] > 0 and head_kpt[1] > 0:
                     cv.putText(roi_output, f'P: {person_idx}', (int(head_kpt[0]) - 20, int(head_kpt[1]) - 15),
                               cv.FONT_HERSHEY_SIMPLEX, 0.7, color_line, 2)
-        else:
-            print(f"Nessuna persona con keypoints rilevata.")  # DEBUG
 
-
-        # Disegna il trapezio della ROI sul frame originale
+        # Draw the ROI trapezoid outline on the full frame
         draw_trapezoid_on_frame(output_frame, trap_points, color=(0, 255, 0), thickness=2)
 
         fps_val = 1.0 / process_time if process_time > 0 else 0  # Calculate FPS
@@ -419,7 +466,7 @@ def yolo_pose_predict(source=0, size=(1440, 810)):
         draw_text_with_bg(output_frame, f'YOLO-Pose Predict (SAHI) FPS: {int(fps_avg)}', (50, 60), bg_color=(0, 150, 255), font_scale=1.2)
         draw_text_with_bg(output_frame, f'Time: {process_time * 1000:.1f}ms', (50, 145), bg_color=(0, 150, 255),
                           font_scale=1.2)
-        draw_text_with_bg(output_frame, f'Frame: {frame_count} | Persone: {num_persons} | Rilevamenti: {num_detections}', (50, 230), bg_color=(0, 150, 255),
+        draw_text_with_bg(output_frame, f'Frame: {frame_count} | Persone: {num_persons} | Detections: {num_detections}', (50, 230), bg_color=(0, 150, 255),
                           font_scale=1.2)
 
         draw_text_with_bg(roi_output, f'ROI - Persone: {num_persons}', (10, 40), bg_color=(0, 150, 255),
@@ -439,13 +486,232 @@ def yolo_pose_predict(source=0, size=(1440, 810)):
     cv.destroyAllWindows()
 
 
+def yolo_sahi_pose_tracking(source=0, size=(1440, 810), sahi_conf_threshold=0.4, sahi_iou_threshold=0.7, pose_conf_threshold=0.5, pose_iou_threshold=0.7, tracker_iou_threshold=0.5):
+    """
+    Combines SAHI detection, YOLO pose estimation, and IOU-based tracking.
+    
+    Args:
+        source: video source (e.g., 0 for webcam, "path/to/video.mp4").
+        size: tuple (width, height) for resizing frames.
+        sahi_conf_threshold: confidence threshold for initial SAHI person detection.
+        sahi_iou_threshold: IOU threshold for SAHI's NMS.
+        pose_conf_threshold: confidence threshold for keypoints detection by the pose model.
+        pose_iou_threshold: IOU threshold for NMS in the pose model.
+        tracker_iou_threshold: IOU threshold for our custom IOUTracker.
+    """
+    connections = [
+        (0, 1), (0, 2), (1, 3), (2, 4),
+        (5, 6), (5, 7), (6, 8), (7, 9), (8, 10),
+        (5, 11), (6, 12), (11, 12),
+        (11, 13), (12, 14), (13, 15), (14, 16)
+    ]
+
+    sahi_detection_model = AutoDetectionModel.from_pretrained(
+        model_type="ultralytics",
+        model_path="yolov8x.pt",
+        confidence_threshold=sahi_conf_threshold,
+        image_size=round_to_multiple(640, 32),
+        device="cuda:0"
+    )
+
+    pose_estimation_model = YOLO("yolo11x-pose.pt")
+    iou_tracker = IOUTracker(iou_threshold=tracker_iou_threshold)
+
+    cap = cv.VideoCapture(source)
+
+    orig_width = int(cap.get(cv.CAP_PROP_FRAME_WIDTH))
+    orig_height = int(cap.get(cv.CAP_PROP_FRAME_HEIGHT))
+    original_fps = int(cap.get(cv.CAP_PROP_FPS))
+    
+    trap_mask, trap_points = create_trapezoid_mask(
+        (size[1], size[0]),
+        TRAPEZOID_TOP_LEFT, 
+        TRAPEZ_TOP_RIGHT, 
+        TRAPEZ_BOTTOM_LEFT, 
+        TRAPEZ_BOTTOM_RIGHT, 
+        curve_height=CURVE_HEIGHT
+    )
+    
+    video_writer = cv.VideoWriter("yolo-sahi-pose-tracking.avi", cv.VideoWriter_fourcc(*"mp4v"), original_fps, (size[0], size[1]))
+    
+    if not video_writer.isOpened():
+        print("ERRORE: Impossibile creare il video writer!")
+        cap.release()
+        return
+
+    frame_count = 0
+    global avg_fps # Using the global list for FPS calculation
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame = cv.resize(frame, size)
+        frame_count += 1
+
+        roi_frame_with_black = apply_trapezoid_mask(frame, trap_mask)
+        
+        y_nonzero, x_nonzero, _ = np.where(roi_frame_with_black > 0)
+        
+        cropped_roi_frame = np.zeros_like(frame)
+        min_x, min_y = 0, 0
+
+        if y_nonzero.size > 0 and x_nonzero.size > 0:
+            min_y, max_y = np.min(y_nonzero), np.max(y_nonzero)
+            min_x, max_x = np.min(x_nonzero), np.max(x_nonzero)
+            
+            if max_y > min_y and max_x > min_x:
+                cropped_roi_frame = roi_frame_with_black[min_y:max_y+1, min_x:max_x+1].copy()
+            
+        start_time = time.time()
+        
+        current_frame_detections = [] # Store all detections with keypoints for current frame
+        num_raw_detections = 0 # Count of SAHI person detections
+
+        if cropped_roi_frame.size > 0 and np.any(cropped_roi_frame):
+            # Stage 1: Person detection using SAHI
+            detection_results = get_sliced_prediction(
+                cropped_roi_frame,
+                sahi_detection_model,
+                slice_height=640,
+                slice_width=640,
+                overlap_height_ratio=0.2,
+                overlap_width_ratio=0.2,
+                postprocess_match_metric="IOU",
+                postprocess_match_threshold=sahi_iou_threshold,
+                verbose=0,
+            )
+            
+            if detection_results and detection_results.object_prediction_list:
+                for prediction in detection_results.object_prediction_list:
+                    if prediction.category.id == 0 and prediction.score.value > sahi_conf_threshold:
+                        bbox = prediction.bbox.to_xyxy()
+                        # Adjust bbox to be relative to the original frame's coordinate system for tracking and drawing
+                        adjusted_bbox_global = (int(bbox[0] + min_x), int(bbox[1] + min_y), int(bbox[2] + min_x), int(bbox[3] + min_y))
+                        num_raw_detections += 1
+
+                        p_x1, p_y1, p_x2, p_y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+                        person_crop = cropped_roi_frame[p_y1:p_y2, p_x1:p_x2]
+
+                        if person_crop.size > 0 and np.any(person_crop):
+                            pose_imgsz = round_to_multiple(max(person_crop.shape[:2]), 32)
+                            pose_results = pose_estimation_model.predict(
+                                person_crop,
+                                conf=pose_conf_threshold,
+                                iou=pose_iou_threshold,
+                                imgsz=pose_imgsz,
+                                device='cuda',
+                                verbose=False
+                            )
+
+                            if pose_results and len(pose_results[0].keypoints.xy) > 0:
+                                kpts = pose_results[0].keypoints.xy.cpu().numpy()[0]
+                                adjusted_kpts_global = kpts + [min_x + p_x1, min_y + p_y1]
+                                current_frame_detections.append({'bbox': adjusted_bbox_global, 'keypoints': adjusted_kpts_global})
+        
+        # Stage 3: Update tracker with current frame's detections
+        tracked_objects = iou_tracker.update(current_frame_detections)
+        num_persons = len(tracked_objects) # Number of unique tracked persons
+
+        process_time = time.time() - start_time
+
+        output_frame = frame.copy()
+        roi_output = roi_frame_with_black.copy()
+        
+        # Draw tracked objects
+        if num_persons > 0:
+            for tracked_obj in tracked_objects:
+                track_id = tracked_obj['track_id']
+                bbox = tracked_obj['bbox']
+                person_kpts = tracked_obj['keypoints']
+
+                x1, y1, x2, y2 = bbox
+                
+                # Generate a color based on track_id for consistency
+                color_line = (int(50 * track_id) % 256, int(100 * track_id) % 256, int(150 * track_id) % 256)
+
+                # Draw bounding box
+                cv.rectangle(roi_output, (x1, y1), (x2, y2), color_line, 2)
+                
+                # Draw connections
+                for start, end in connections:
+                    if start < len(person_kpts) and end < len(person_kpts):
+                        pt1, pt2 = person_kpts[start], person_kpts[end]
+                        if pt1[0] > 0 and pt1[1] > 0 and pt2[0] > 0 and pt2[1] > 0:
+                            cv.line(roi_output, (int(pt1[0]), int(pt1[1])),
+                                     (int(pt2[0]), int(pt2[1])), color_line, 2)
+
+                # Draw keypoints
+                for pt in person_kpts:
+                    if pt[0] > 0 and pt[1] > 0:
+                        cv.circle(roi_output, (int(pt[0]), int(pt[1])), 3, color_line, -1)
+                        cv.circle(roi_output, (int(pt[0]), int(pt[1])), 3, (255, 255, 255), 1)
+                
+                # Draw track ID
+                head_kpt = person_kpts[0] if len(person_kpts) > 0 else (0,0)
+                if head_kpt[0] > 0 and head_kpt[1] > 0:
+                    cv.putText(roi_output, f'ID: {track_id}', (int(head_kpt[0]) - 20, int(head_kpt[1]) - 15),
+                              cv.FONT_HERSHEY_SIMPLEX, 0.7, color_line, 2)
+
+        # Draw the ROI trapezoid outline on the full frame
+        draw_trapezoid_on_frame(output_frame, trap_points, color=(0, 255, 0), thickness=2)
+
+        fps_val = 1.0 / process_time if process_time > 0 else 0
+        avg_fps.append(fps_val)
+        fps_avg = sum(avg_fps[-30:]) / len(avg_fps[-30:]) if avg_fps else 0
+
+        draw_text_with_bg(output_frame, f'YOLO-SAHI-Pose Tracking FPS: {int(fps_avg)}', (50, 60), bg_color=(0, 100, 200), font_scale=1.2)
+        draw_text_with_bg(output_frame, f'Time: {process_time * 1000:.1f}ms', (50, 145), bg_color=(0, 100, 200),
+                          font_scale=1.2)
+        draw_text_with_bg(output_frame, f'Frame: {frame_count} | Tracked: {num_persons} | Raw Detections: {num_raw_detections}', (50, 230), bg_color=(0, 100, 200),
+                          font_scale=1.2)
+
+        draw_text_with_bg(roi_output, f'ROI - Tracked Persons: {num_persons}', (10, 40), bg_color=(0, 100, 200),
+                          font_scale=1.0)
+
+        cv.imshow('YOLO SAHI Pose Tracking - Full Frame', output_frame)
+        cv.imshow('YOLO SAHI Pose Tracking - ROI', roi_output)
+
+        video_writer.write(roi_output)
+        if cv.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    video_writer.release()
+    cv.destroyAllWindows()
+
+
 if __name__ == "__main__":
     # Usage examples:
     
     # Scegli quale versione usare:
     # 1. track() - Tracking consistente ma meno rilevamenti
-    # yolo_pose_tracking("video raw/test_clip4.mp4")      # YOLO with tracking
+    # You can now specify conf_threshold and iou_threshold
+    # Try increasing iou_threshold if people are being merged, e.g., 0.7 or 0.8
+    # yolo_pose_tracking("video raw/test_clip4.mp4", conf_threshold=0.3, iou_threshold=0.7)      # YOLO with tracking
     
     # 2. predict() - Massimi rilevamenti ma senza tracking persistente
-    yolo_pose_predict("video raw/test_clip2.mp4")  # YOLO predict with SAHI
-    # yolo_pose_predict(0)           # YOLO predict with webcam and SAHI
+    # You can now specify sahi_conf_threshold, sahi_iou_threshold, pose_conf_threshold, pose_iou_threshold
+    # For SAHI detection (yolov8x.pt), increase sahi_iou_threshold if detections are merging, e.g., 0.7 or 0.8
+    # For pose estimation (yolo11x-pose.pt), similarly adjust pose_iou_threshold
+    # yolo_pose_predict("video raw/test_clip1.mp4", sahi_conf_threshold=0.2, sahi_iou_threshold=0.7, pose_conf_threshold=0.01, pose_iou_threshold=0.2)  # YOLO predict with direct method
+    # yolo_pose_predict(0, sahi_conf_threshold=0.2, sahi_iou_threshold=0.7, pose_conf_threshold=0.3, pose_iou_threshold=0.7)           # YOLO predict with webcam and direct method
+
+    # 3. yolo_sahi_pose_tracking() - SAHI detection + YOLO pose estimation + IOU-based tracking
+    # Adjust `tracker_iou_threshold` for how aggressively detections are assigned to existing tracks.
+    yolo_sahi_pose_tracking(
+        "video raw/test_clip1.mp4",
+        sahi_conf_threshold=0.2,
+        sahi_iou_threshold=0.7,
+        pose_conf_threshold=0.01,
+        pose_iou_threshold=0.2,
+        tracker_iou_threshold=0.5 # Adjust this threshold for tracking consistency
+    )
+    # yolo_sahi_pose_tracking(
+    #     0, # for webcam
+    #     sahi_conf_threshold=0.2,
+    #     sahi_iou_threshold=0.7,
+    #     pose_conf_threshold=0.01,
+    #     pose_iou_threshold=0.2,
+    #     tracker_iou_threshold=0.5
+    # )          # YOLO predict with webcam and direct method

@@ -8,3 +8,5 @@
 /.idea
 *.jpg
 /sapiens
+*.avi
+/__pycache__
