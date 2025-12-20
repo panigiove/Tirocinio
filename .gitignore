@@ -10,3 +10,5 @@
 /sapiens
 *.avi
 /__pycache__
+*.mp4
+*.csv
