@@ -13,7 +13,7 @@ from sahi.predict import get_sliced_prediction
 from sahi import AutoDetectionModel
 
 from iou_tracker import IOUTracker
-# from appearence_utils import compute_team_appearance, keypoints_to_pose_vec # removed
+from appearence_utils import compute_team_appearance, keypoints_to_pose_vec
 
 # ================= ROI / MASK =================
 TRAPEZOID_TOP_LEFT = (210, 380)
@@ -76,24 +76,24 @@ def yolo_sahi_pose_tracking(
     output_path='yolo_sahi_pose_tracking_latest.mp4',
     size=(1440, 810),
     # detection
-    sahi_conf_threshold=0.25,
-    sahi_iou_threshold=0.75,
+    sahi_conf_threshold=0.28, #soglia di confidenza minima per considerare una detection valida
+    sahi_iou_threshold=0.50, #soglia di iou per il postprocessing delle slice, più alto-> meno fusioni, più basso-> più fusioni
     slice_h=640,
     slice_w=640,
-    slice_overlap=0.2,
+    slice_overlap=0.35, #sovrapposizione percentuale tra slice
     # pose
-    pose_conf_threshold=0.15,
-    pose_iou_threshold=0.05,
+    pose_conf_threshold=0.08, #soglia di confidenza minima per considerare una pose valida
+    pose_iou_threshold=0.01, #soglia di iou per NMS durante la stima della posa (riduce duplicati)
     pose_attempts=(
         {'pad': 0.0, 'conf': None, 'iou': None},
-        {'pad': 0.25, 'conf': 0.05, 'iou': 0.05},
+        {'pad': 0.25, 'conf': 0.03, 'iou': 0.005},
     ),
     # tracker
-    match_threshold=0.45,
-    iou_weight=0.45,
-    # appearance_weight=0.35, # removed
-    # pose_weight=0.20, # removed
-    max_missed_frames=20,
+    match_threshold=0.30, #soglia minima di similarità combinate per accettare un abbinamento tra track e detection. Valore alto->meno switch ma più tracce nuove, più basso->meno tracce nuove ma rischio di accoppiare due persone per sbaglio
+    iou_weight=0.27, #aumenta il peso della sovrapposizione spaziale (più alto->funziona meglio quando ci sono poche sovrapposizioni)
+    appearance_weight=0.45, # matching robusto quando i vestiti sono distintivi
+    pose_weight=0.30, #  aumenta il peso delle pose stimate, utile in sovrapposizioni prolungate
+    max_missed_frames=50,
 ):
     # skeleton connections (YOLO format)
     connections = [
@@ -117,8 +117,8 @@ def yolo_sahi_pose_tracking(
         match_threshold=match_threshold,
         max_missed_frames=max_missed_frames,
         iou_weight=iou_weight,
-        # appearance_weight=appearance_weight, # removed
-        # pose_weight=pose_weight # removed
+        appearance_weight=appearance_weight,
+        pose_weight=pose_weight
     )
 
     cap = cv.VideoCapture(source)
@@ -165,7 +165,7 @@ def yolo_sahi_pose_tracking(
             overlap_height_ratio=slice_overlap,
             overlap_width_ratio=slice_overlap,
             postprocess_match_metric='IOU',
-            postprocess_match_threshold=sahi_iou_threshold,
+            postprocess_match_threshold=sahi_iou_threshold, # adjusted here
             verbose=0
         )
 
@@ -177,8 +177,8 @@ def yolo_sahi_pose_tracking(
                 bx1, by1, bx2, by2 = map(int, p.bbox.to_xyxy())
                 bbox = (bx1 + min_x, by1 + min_y, bx2 + min_x, by2 + min_y)
 
-                # appearance = compute_team_appearance(frame, bbox) # removed
-                pose_kpts, pose_vec = None, None # pose_vec is no longer used for tracking, but pose_kpts might be needed for drawing
+                appearance = compute_team_appearance(frame, bbox)
+                pose_kpts, pose_vec = None, None
 
                 for att in pose_attempts:
                     pb = pad_bbox(bbox, att['pad'], frame.shape)
@@ -199,14 +199,14 @@ def yolo_sahi_pose_tracking(
                     if res and len(res[0].keypoints.xy) > 0:
                         k = res[0].keypoints.xy.cpu().numpy()[0]
                         pose_kpts = k + np.array([x1, y1])
-                        # pose_vec = keypoints_to_pose_vec(pose_kpts, bbox) # removed
+                        pose_vec = keypoints_to_pose_vec(pose_kpts, bbox)
                         break
 
                 detections.append({
                     'bbox': bbox,
-                    # 'appearance': appearance, # removed
+                    'appearance': appearance,
                     'keypoints': pose_kpts,
-                    # 'pose_vec': pose_vec # removed
+                    'pose_vec': pose_vec
                 })
 
         tracks = tracker.update(detections)
@@ -239,7 +239,7 @@ def yolo_sahi_pose_tracking(
 
         writer.write(out)
         cv.imshow('Tracking', out)
-        if cv.waitKey(1) == 27:
+        if cv.waitKey(1) & 0xFF == ord('q'):
             break
 
     cap.release()

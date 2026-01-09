@@ -423,10 +423,10 @@ if __name__ == "__main__":
     
     # Scegli quale versione usare:
     # 1. track() - Tracking consistente ma meno rilevamenti
-    yolo_pose_tracking("video raw/test_clip4.mp4")      # YOLO with tracking
+    #yolo_pose_tracking("video raw/test_clip4.mp4")      # YOLO with tracking
     
     # 2. predict() - Massimi rilevamenti ma senza tracking persistente
-    #yolo_pose_predict("video raw/test_clip2.mp4")  # YOLO senza tracking
+    yolo_pose_predict("video raw/test_clip2.mp4")  # YOLO senza tracking
 
     #yolo_pose(0)                   # YOLO with webcam
     #yolo_pose_predict(0)           # YOLO predict with webcam
