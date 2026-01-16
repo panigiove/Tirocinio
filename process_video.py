@@ -13,7 +13,7 @@ from sahi.predict import get_sliced_prediction
 from sahi import AutoDetectionModel
 
 from iou_tracker import IOUTracker
-from appearence_utils import compute_team_appearance, keypoints_to_pose_vec
+from appearence_utils import compute_team_appearence, keypoints_to_pose_vec
 
 # ================= ROI / MASK =================
 TRAPEZOID_TOP_LEFT = (210, 380)
@@ -76,24 +76,25 @@ def yolo_sahi_pose_tracking(
     output_path='yolo_sahi_pose_tracking_latest.mp4',
     size=(1440, 810),
     # detection
-    sahi_conf_threshold=0.28, #soglia di confidenza minima per considerare una detection valida
+    sahi_conf_threshold=0.29, #soglia di confidenza minima per considerare una detection valida
     sahi_iou_threshold=0.50, #soglia di iou per il postprocessing delle slice, più alto-> meno fusioni, più basso-> più fusioni
     slice_h=640,
     slice_w=640,
-    slice_overlap=0.35, #sovrapposizione percentuale tra slice
+    slice_overlap=0.37, #sovrapposizione percentuale tra slice
     # pose
-    pose_conf_threshold=0.08, #soglia di confidenza minima per considerare una pose valida
+    pose_conf_threshold=0.09, #soglia di confidenza minima per considerare una pose valida
     pose_iou_threshold=0.01, #soglia di iou per NMS durante la stima della posa (riduce duplicati)
     pose_attempts=(
         {'pad': 0.0, 'conf': None, 'iou': None},
         {'pad': 0.25, 'conf': 0.03, 'iou': 0.005},
     ),
     # tracker
-    match_threshold=0.30, #soglia minima di similarità combinate per accettare un abbinamento tra track e detection. Valore alto->meno switch ma più tracce nuove, più basso->meno tracce nuove ma rischio di accoppiare due persone per sbaglio
+    match_threshold=0.29, #soglia minima di similarità combinate per accettare un abbinamento tra track e detection. Valore alto->meno switch ma più tracce nuove, più basso->meno tracce nuove ma rischio di accoppiare due persone per sbaglio
     iou_weight=0.27, #aumenta il peso della sovrapposizione spaziale (più alto->funziona meglio quando ci sono poche sovrapposizioni)
-    appearance_weight=0.45, # matching robusto quando i vestiti sono distintivi
-    pose_weight=0.30, #  aumenta il peso delle pose stimate, utile in sovrapposizioni prolungate
-    max_missed_frames=50,
+    appearance_weight=0.5, # matching robusto quando i vestiti sono distintivi
+    pose_weight=0.33, #  aumenta il peso delle pose stimate, utile in sovrapposizioni prolungate
+    max_missed_frames=60,
+    ema_alpha=0.9 #valore alto -> molto peso all'osservazione nuova, valore basso -> più peso alla storia (lento adattamento    )
 ):
     # skeleton connections (YOLO format)
     connections = [
@@ -106,7 +107,7 @@ def yolo_sahi_pose_tracking(
     # models
     det_model = AutoDetectionModel.from_pretrained(
         model_type='ultralytics',
-        model_path='yolov8x.pt',
+        model_path='yolo11x.pt',
         confidence_threshold=sahi_conf_threshold,
         image_size=round_to_multiple(640, 32),
         device='cuda:0'
@@ -118,7 +119,8 @@ def yolo_sahi_pose_tracking(
         max_missed_frames=max_missed_frames,
         iou_weight=iou_weight,
         appearance_weight=appearance_weight,
-        pose_weight=pose_weight
+        pose_weight=pose_weight,
+        ema_alpha=ema_alpha
     )
 
     cap = cv.VideoCapture(source)
@@ -177,7 +179,7 @@ def yolo_sahi_pose_tracking(
                 bx1, by1, bx2, by2 = map(int, p.bbox.to_xyxy())
                 bbox = (bx1 + min_x, by1 + min_y, bx2 + min_x, by2 + min_y)
 
-                appearance = compute_team_appearance(frame, bbox)
+                appearance = compute_team_appearence(frame, bbox)
                 pose_kpts, pose_vec = None, None
 
                 for att in pose_attempts:

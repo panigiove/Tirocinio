@@ -5,7 +5,7 @@ import cv2 as cv
 import numpy as np
 
 
-def compute_team_appearance(frame, bbox, h_bins=32, s_bins=12, upper_fraction=0.6):
+def compute_team_appearence(frame, bbox, h_bins=32, s_bins=12, upper_fraction=0.6):
     """
     Extract an appearance descriptor robust to team sports:
     - HSV histogram (H,S) from upper body (jersey area)
