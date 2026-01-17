@@ -28,5 +28,3 @@ Piccolo file descrittivo di "process_video.py", "iou_tracker.py" e "appearence_u
 
 - termina il programma
 
-# Descrittore "iou_tracker.py"
-

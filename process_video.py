@@ -76,14 +76,14 @@ def yolo_sahi_pose_tracking(
     output_path='yolo_sahi_pose_tracking_latest.mp4',
     size=(1440, 810),
     # detection
-    sahi_conf_threshold=0.29, #soglia di confidenza minima per considerare una detection valida
+    sahi_conf_threshold=0.25, #soglia di confidenza minima per considerare una detection valida
     sahi_iou_threshold=0.50, #soglia di iou per il postprocessing delle slice, più alto-> meno fusioni, più basso-> più fusioni
     slice_h=640,
     slice_w=640,
     slice_overlap=0.37, #sovrapposizione percentuale tra slice
     # pose
     pose_conf_threshold=0.09, #soglia di confidenza minima per considerare una pose valida
-    pose_iou_threshold=0.01, #soglia di iou per NMS durante la stima della posa (riduce duplicati)
+    pose_iou_threshold=0.02, #soglia di iou per NMS durante la stima della posa (riduce duplicati)
     pose_attempts=(
         {'pad': 0.0, 'conf': None, 'iou': None},
         {'pad': 0.25, 'conf': 0.03, 'iou': 0.005},
@@ -91,7 +91,7 @@ def yolo_sahi_pose_tracking(
     # tracker
     match_threshold=0.29, #soglia minima di similarità combinate per accettare un abbinamento tra track e detection. Valore alto->meno switch ma più tracce nuove, più basso->meno tracce nuove ma rischio di accoppiare due persone per sbaglio
     iou_weight=0.27, #aumenta il peso della sovrapposizione spaziale (più alto->funziona meglio quando ci sono poche sovrapposizioni)
-    appearance_weight=0.5, # matching robusto quando i vestiti sono distintivi
+    appearance_weight=0.45, # matching robusto quando i vestiti sono distintivi
     pose_weight=0.33, #  aumenta il peso delle pose stimate, utile in sovrapposizioni prolungate
     max_missed_frames=60,
     ema_alpha=0.9 #valore alto -> molto peso all'osservazione nuova, valore basso -> più peso alla storia (lento adattamento    )
@@ -250,4 +250,4 @@ def yolo_sahi_pose_tracking(
 
 
 if __name__ == '__main__':
-    yolo_sahi_pose_tracking('video raw/test_clip1.mp4')
+    yolo_sahi_pose_tracking('video raw/test_clip5.mp4')
