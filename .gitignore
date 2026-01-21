@@ -12,3 +12,5 @@
 /__pycache__
 *.mp4
 *.csv
+/tracking_12.v2i.yolo26
+/tracking_12.v2i.yolov11

@@ -11,6 +11,7 @@ import time
 from ultralytics import YOLO
 from sahi.predict import get_sliced_prediction
 from sahi import AutoDetectionModel
+import csv # new import
 
 from iou_tracker import IOUTracker
 from appearence_utils import compute_team_appearence, keypoints_to_pose_vec
@@ -74,6 +75,7 @@ def draw_text_with_bg(img, text, pos, scale=0.6):
 def yolo_sahi_pose_tracking(
     source,
     output_path='yolo_sahi_pose_tracking_latest.mp4',
+    output_csv_path='track_events.csv', # new argument
     size=(1440, 810),
     # detection
     sahi_conf_threshold=0.25, #soglia di confidenza minima per considerare una detection valida
@@ -89,7 +91,7 @@ def yolo_sahi_pose_tracking(
         {'pad': 0.25, 'conf': 0.03, 'iou': 0.005},
     ),
     # tracker
-    match_threshold=0.29, #soglia minima di similarità combinate per accettare un abbinamento tra track e detection. Valore alto->meno switch ma più tracce nuove, più basso->meno tracce nuove ma rischio di accoppiare due persone per sbaglio
+    match_threshold=0.25, #soglia minima di similarità combinate per accettare un abbinamento tra track e detection. Valore alto->meno switch ma più tracce nuove, più basso->meno tracce nuove ma rischio di accoppiare due persone per sbaglio
     iou_weight=0.27, #aumenta il peso della sovrapposizione spaziale (più alto->funziona meglio quando ci sono poche sovrapposizioni)
     appearance_weight=0.45, # matching robusto quando i vestiti sono distintivi
     pose_weight=0.33, #  aumenta il peso delle pose stimate, utile in sovrapposizioni prolungate
@@ -137,6 +139,11 @@ def yolo_sahi_pose_tracking(
         output_path,
         cv.VideoWriter_fourcc(*'mp4v'), fps, size
     )
+
+    # new: setup CSV writer for track events
+    csv_file = open(output_csv_path, 'w', newline='')
+    csv_writer = csv.DictWriter(csv_file, fieldnames=['frame', 'track_id', 'event'])
+    csv_writer.writeheader()
 
     frame_id = 0
     fps_hist = []
@@ -211,7 +218,12 @@ def yolo_sahi_pose_tracking(
                     'pose_vec': pose_vec
                 })
 
-        tracks = tracker.update(detections)
+        tracks = tracker.update(detections, frame_id) # new: pass frame_id to update
+        
+        # new: write track events to CSV
+        frame_events = tracker.get_frame_events()
+        for event in frame_events:
+            csv_writer.writerow(event)
 
         out = roi.copy()
         for t in tracks:
@@ -247,7 +259,8 @@ def yolo_sahi_pose_tracking(
     cap.release()
     writer.release()
     cv.destroyAllWindows()
+    csv_file.close() # new: close the CSV file when done
 
 
 if __name__ == '__main__':
-    yolo_sahi_pose_tracking('video raw/test_clip5.mp4')
+    yolo_sahi_pose_tracking('video raw/video-20260119T131608Z-1-004/video/tracking_12/out4.mp4')
