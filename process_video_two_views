@@ -1,13 +1,7 @@
-# process_video.py
-# Latest version
-# - Pose estimation attempted for EVERY detected bounding box (multi-attempt, padded fallback)
-# - Hungarian-based tracking (see iou_tracker.py)
-# - Appearance tuned for team sports (see appearance_utils.py)
-# - Only draw boxes for tracks UPDATED in the current frame (no thin/ghost boxes)
-
 import cv2 as cv
 import numpy as np
 import time
+from collections import deque
 from ultralytics import YOLO
 from sahi.predict import get_sliced_prediction
 from sahi import AutoDetectionModel
@@ -25,8 +19,8 @@ TRAPEZ_BOTTOM_RIGHT_1 = (1440, 810)
 CURVE_HEIGHT_1 = 0
 
 # Mask for View 2 (Placeholder values, adjust as needed)
-TRAPEZ_TOP_LEFT_2 = (200, 350)
-TRAPEZ_TOP_RIGHT_2 = (1240, 350)
+TRAPEZ_TOP_LEFT_2 = (200, 310)
+TRAPEZ_TOP_RIGHT_2 = (1240, 310)
 TRAPEZ_BOTTOM_LEFT_2 = (0, 665)
 TRAPEZ_BOTTOM_RIGHT_2 = (1440, 665)
 CURVE_HEIGHT_2 = 65
@@ -65,9 +59,56 @@ def pad_bbox(bbox, pad_ratio, frame_shape):
     return (
         max(0, x1 - pw),
         max(0, y1 - ph),
-        min(frame_shape[1] - 1, x2 + pw), # fixed: was x2+pw, y2+ph
-        min(frame_shape[0] - 1, y2 + ph)  # fixed: was x2+pw, y2+ph
+        min(frame_shape[1] - 1, x2 + pw),
+        min(frame_shape[0] - 1, y2 + ph)
     )
+
+
+def process_detection_pose(frame, bbox, pose_model, pose_attempts, pose_conf_threshold, pose_iou_threshold):
+    """
+    Optimized single detection pose estimation with early exit.
+    """
+    pose_kpts, pose_vec = None, None
+    
+    # Try first attempt (usually no padding, fastest)
+    pb = pad_bbox(bbox, pose_attempts[0]['pad'], frame.shape)
+    px1, py1, px2, py2 = pb
+    crop = frame[py1:py2, px1:px2]
+    if crop.size > 0:
+        res = pose_model.predict(
+            crop, 
+            conf=pose_attempts[0].get('conf') or pose_conf_threshold,
+            iou=pose_attempts[0].get('iou') or pose_iou_threshold,
+            imgsz=round_to_multiple(max(crop.shape[:2]), 32),
+            device='cuda',
+            verbose=False
+        )
+        if res and len(res[0].keypoints.xy) > 0:
+            k = res[0].keypoints.xy.cpu().numpy()[0]
+            pose_kpts = k + np.array([px1, py1])
+            pose_vec = keypoints_to_pose_vec(pose_kpts, bbox)
+            return pose_kpts, pose_vec
+    
+    # Fallback to second attempt only if first failed
+    if len(pose_attempts) > 1:
+        pb = pad_bbox(bbox, pose_attempts[1]['pad'], frame.shape)
+        px1, py1, px2, py2 = pb
+        crop = frame[py1:py2, px1:px2]
+        if crop.size > 0:
+            res = pose_model.predict(
+                crop,
+                conf=pose_attempts[1].get('conf') or pose_conf_threshold,
+                iou=pose_attempts[1].get('iou') or pose_iou_threshold,
+                imgsz=round_to_multiple(max(crop.shape[:2]), 32),
+                device='cuda',
+                verbose=False
+            )
+            if res and len(res[0].keypoints.xy) > 0:
+                k = res[0].keypoints.xy.cpu().numpy()[0]
+                pose_kpts = k + np.array([px1, py1])
+                pose_vec = keypoints_to_pose_vec(pose_kpts, bbox)
+    
+    return pose_kpts, pose_vec
 
 
 def draw_text_with_bg(img, text, pos, scale=0.6):
@@ -83,48 +124,45 @@ def parse_yolo_annotations(anno_file, img_width, img_height, frame, pose_model, 
     if not anno_file: # Handle cases where annotation file might be None
         return detections
     try:
+        lines_read = 0
         with open(anno_file, 'r') as f:
             for line in f:
+                lines_read += 1
                 parts = line.strip().split(' ')
+                if len(parts) < 5:
+                    continue  # Skip invalid lines
                 class_id = int(parts[0])
-                # Assuming class_id 0 is 'person' which is what we are tracking
-                if class_id == 0:
-                    center_x, center_y, width, height = map(float, parts[1:])
-                    # Convert normalized YOLO format to pixel coordinates (xyxy)
-                    x1 = int((center_x - width / 2) * img_width)
-                    y1 = int((center_y - height / 2) * img_height)
-                    x2 = int((center_x + width / 2) * img_width)
-                    y2 = int((center_y + height / 2) * img_height)
-                    bbox = (x1, y1, x2, y2)
+                # Process all annotations (class_id can be any value - player IDs, object types, etc.)
+                center_x, center_y, width, height = map(float, parts[1:])
+                # Convert normalized YOLO format to pixel coordinates (xyxy)
+                x1 = int((center_x - width / 2) * img_width)
+                y1 = int((center_y - height / 2) * img_height)
+                x2 = int((center_x + width / 2) * img_width)
+                y2 = int((center_y + height / 2) * img_height)
+                bbox = (x1, y1, x2, y2)
 
-                    appearance = compute_team_appearence(frame, bbox)
-                    pose_kpts, pose_vec = None, None
+                appearance = compute_team_appearence(frame, bbox)
+                pose_kpts, pose_vec = None, None
 
-                    # Perform pose estimation on the annotated bounding box
-                    for att in pose_attempts:
-                        pb = pad_bbox(bbox, att['pad'], frame.shape)
-                        px1, py1, px2, py2 = pb
-                        crop = frame[py1:py2, px1:px2]
-                        if crop.size == 0: continue
-                        res = pose_model.predict(
-                            crop, conf=att['conf'] or pose_conf_threshold, iou=att['iou'] or pose_iou_threshold,
-                            imgsz=round_to_multiple(max(crop.shape[:2]), 32), device='cuda', verbose=False
-                        )
-                        if res and len(res[0].keypoints.xy) > 0:
-                            k = res[0].keypoints.xy.cpu().numpy()[0]
-                            pose_kpts = k + np.array([px1, py1])
-                            pose_vec = keypoints_to_pose_vec(pose_kpts, bbox)
-                            break # Found a pose, break from attempts
+                # Perform pose estimation on the annotated bounding box (optimized)
+                pose_kpts, pose_vec = process_detection_pose(
+                    frame, bbox, pose_model, pose_attempts, pose_conf_threshold, pose_iou_threshold
+                )
 
-                    detections.append({
-                        'bbox': bbox,
-                        'appearance': appearance,
-                        'keypoints': pose_kpts,
-                        'pose_vec': pose_vec,
-                        'score': 1.0 # Assign a high score for initial annotations
-                    })
+                detections.append({
+                    'bbox': bbox,
+                    'appearance': appearance,
+                    'keypoints': pose_kpts,
+                    'pose_vec': pose_vec,
+                    'score': 1.0 # Assign a high score for initial annotations
+                })
+        print(f"  Parsed {lines_read} lines from annotation file, created {len(detections)} detections")
     except FileNotFoundError:
         print(f"warning: annotation file not found at {anno_file}. skipping initial annotations for this view.")
+    except Exception as e:
+        print(f"error: failed to parse annotations from {anno_file}: {e}")
+        import traceback
+        traceback.print_exc()
     return detections
 
 # ================= MAIN =================
@@ -220,15 +258,16 @@ def yolo_sahi_pose_tracking(
     )
 
     csv_file1 = open(output_csv_path1, 'w', newline='')
-    csv_writer1 = csv.DictWriter(csv_file1, fieldnames=['frame', 'track_id', 'event', 'view']) # added 'view'
+    csv_writer1 = csv.DictWriter(csv_file1, fieldnames=['frame', 'track_id', 'event', 'view', 'global_id', 'matched_with_other_view_track_id'])
     csv_writer1.writeheader()
 
     csv_file2 = open(output_csv_path2, 'w', newline='')
-    csv_writer2 = csv.DictWriter(csv_file2, fieldnames=['frame', 'track_id', 'event', 'view']) # added 'view'
+    csv_writer2 = csv.DictWriter(csv_file2, fieldnames=['frame', 'track_id', 'event', 'view', 'global_id', 'matched_with_other_view_track_id'])
     csv_writer2.writeheader()
 
+
     frame_id = 0
-    fps_hist = []
+    fps_hist = deque(maxlen=30)  # Use deque for efficient FPS history (fixed size)
 
     # Process initial frame with annotations
     ok1, frame1 = cap1.read()
@@ -242,16 +281,25 @@ def yolo_sahi_pose_tracking(
     frame_id += 1
 
     print(f"loading initial annotations for view 1 from {initial_annotations_path1}")
+    print(f"  Frame size: {frame1.shape}, Processing size: {size[0]}x{size[1]}")
     initial_detections1 = parse_yolo_annotations(
         initial_annotations_path1, size[0], size[1], frame1, pose_model, pose_attempts, pose_conf_threshold, pose_iou_threshold
     )
     print(f"loading initial annotations for view 2 from {initial_annotations_path2}")
+    print(f"  Frame size: {frame2.shape}, Processing size: {size[0]}x{size[1]}")
     initial_detections2 = parse_yolo_annotations(
         initial_annotations_path2, size[0], size[1], frame2, pose_model, pose_attempts, pose_conf_threshold, pose_iou_threshold
     )
 
-    tracks1 = tracker1.update(initial_detections1, frame_id)
-    tracks2 = tracker2.update(initial_detections2, frame_id)
+    # Store initial counts
+    max_tracks_view1 = len(initial_detections1)
+    max_tracks_view2 = len(initial_detections2)
+    print(f"view 1: {max_tracks_view1} initial tracks detected.")
+    print(f"view 2: {max_tracks_view2} initial tracks detected.")
+
+
+    tracks1, _, _ = tracker1.update(initial_detections1, frame_id)
+    tracks2, _, _ = tracker2.update(initial_detections2, frame_id)
 
     # Main loop for subsequent frames
     while cap1.isOpened() and cap2.isOpened():
@@ -264,101 +312,99 @@ def yolo_sahi_pose_tracking(
         frame2 = cv.resize(frame2, size)
         frame_id += 1
 
-        start_time = time.time() # Renamed to avoid conflict with `start` variable in the loop
+        start_time = time.time()
 
         # --- Process View 1 ---
-        roi1 = apply_trapezoid_mask(frame1, mask1) # Apply mask1
-        ys1, xs1 = np.where(roi1[:, :, 0] > 0)
+        roi1 = apply_trapezoid_mask(frame1, mask1)
+        # Optimized: use np.any along axis for faster ROI bounds calculation
+        mask_1d = np.any(roi1 > 0, axis=2)
         detections1 = []
-        if len(xs1) > 0:
-            min_x1, max_x1 = xs1.min(), xs1.max()
-            min_y1, max_y1 = ys1.min(), ys1.max()
+        if np.any(mask_1d):
+            coords = np.where(mask_1d)
+            min_y1, max_y1 = coords[0].min(), coords[0].max()
+            min_x1, max_x1 = coords[1].min(), coords[1].max()
             cropped1 = roi1[min_y1:max_y1 + 1, min_x1:max_x1 + 1]
 
             preds1 = get_sliced_prediction(
-                cropped1, det_model, slice_height=slice_h, slice_width=slice_w, # Changed slice_h/w
+                cropped1, det_model, slice_height=slice_h, slice_width=slice_w,
                 overlap_height_ratio=slice_overlap, overlap_width_ratio=slice_overlap,
                 postprocess_match_metric='IOU', postprocess_match_threshold=sahi_iou_threshold, verbose=0
             )
 
             if preds1 and preds1.object_prediction_list:
-                for p in preds1.object_prediction_list:
-                    if p.category.id != 0 or p.score.value < sahi_conf_threshold:
-                        continue
+                # Pre-filter and sort by score before processing
+                valid_preds = [(p, p.score.value) for p in preds1.object_prediction_list 
+                              if p.category.id == 0 and p.score.value >= sahi_conf_threshold]
+                valid_preds.sort(key=lambda x: x[1], reverse=True)
+                valid_preds = valid_preds[:max_tracks_view1]  # Limit before expensive operations
+                
+                current_frame_all_detections1 = []
+                for p, score in valid_preds:
                     bx1, by1, bx2, by2 = map(int, p.bbox.to_xyxy())
                     bbox = (bx1 + min_x1, by1 + min_y1, bx2 + min_x1, by2 + min_y1)
+                    
+                    # Process appearance and pose in parallel (appearance is fast, pose is slow)
                     appearance = compute_team_appearence(frame1, bbox)
-                    pose_kpts, pose_vec = None, None
-
-                    for att in pose_attempts:
-                        pb = pad_bbox(bbox, att['pad'], frame1.shape)
-                        x1, y1, x2, y2 = pb
-                        crop = frame1[y1:y2, x1:x2]
-                        if crop.size == 0: continue
-                        res = pose_model.predict(
-                            crop, conf=att['conf'] or pose_conf_threshold, iou=att['iou'] or pose_iou_threshold,
-                            imgsz=round_to_multiple(max(crop.shape[:2]), 32), device='cuda', verbose=False
-                        )
-                        if res and len(res[0].keypoints.xy) > 0:
-                            k = res[0].keypoints.xy.cpu().numpy()[0]
-                            pose_kpts = k + np.array([x1, y1])
-                            pose_vec = keypoints_to_pose_vec(pose_kpts, bbox)
-                            break
-                    detections1.append({
-                        'bbox': bbox, 'appearance': appearance, 'keypoints': pose_kpts, 'pose_vec': pose_vec
+                    pose_kpts, pose_vec = process_detection_pose(
+                        frame1, bbox, pose_model, pose_attempts, pose_conf_threshold, pose_iou_threshold
+                    )
+                    
+                    current_frame_all_detections1.append({
+                        'bbox': bbox, 'appearance': appearance, 'keypoints': pose_kpts, 'pose_vec': pose_vec, 'score': score
                     })
-        tracks1 = tracker1.update(detections1, frame_id)
+                detections1 = current_frame_all_detections1
+
+        tracks1, _, _ = tracker1.update(detections1, frame_id)
         frame_events1 = tracker1.get_frame_events()
         for event in frame_events1:
             event['view'] = 1 # add view identifier
             csv_writer1.writerow(event)
 
         # --- Process View 2 ---
-        roi2 = apply_trapezoid_mask(frame2, mask2) # Apply mask2
-        ys2, xs2 = np.where(roi2[:, :, 0] > 0)
+        roi2 = apply_trapezoid_mask(frame2, mask2)
+        # Optimized: use np.any along axis for faster ROI bounds calculation
+        mask_2d = np.any(roi2 > 0, axis=2)
         detections2 = []
-        if len(xs2) > 0:
-            min_x2, max_x2 = xs2.min(), xs2.max()
-            min_y2, max_y2 = ys2.min(), ys2.max()
+        if np.any(mask_2d):
+            coords = np.where(mask_2d)
+            min_y2, max_y2 = coords[0].min(), coords[0].max()
+            min_x2, max_x2 = coords[1].min(), coords[1].max()
             cropped2 = roi2[min_y2:max_y2 + 1, min_x2:max_x2 + 1]
 
             preds2 = get_sliced_prediction(
-                cropped2, det_model, slice_height=slice_h, slice_width=slice_w, # Changed slice_h/w
+                cropped2, det_model, slice_height=slice_h, slice_width=slice_w,
                 overlap_height_ratio=slice_overlap, overlap_width_ratio=slice_overlap,
                 postprocess_match_metric='IOU', postprocess_match_threshold=sahi_iou_threshold, verbose=0
             )
 
             if preds2 and preds2.object_prediction_list:
-                for p in preds2.object_prediction_list:
-                    if p.category.id != 0 or p.score.value < sahi_conf_threshold:
-                        continue
+                # Pre-filter and sort by score before processing
+                valid_preds = [(p, p.score.value) for p in preds2.object_prediction_list 
+                              if p.category.id == 0 and p.score.value >= sahi_conf_threshold]
+                valid_preds.sort(key=lambda x: x[1], reverse=True)
+                valid_preds = valid_preds[:max_tracks_view2]  # Limit before expensive operations
+                
+                current_frame_all_detections2 = []
+                for p, score in valid_preds:
                     bx1, by1, bx2, by2 = map(int, p.bbox.to_xyxy())
                     bbox = (bx1 + min_x2, by1 + min_y2, bx2 + min_x2, by2 + min_y2)
+                    
+                    # Process appearance and pose
                     appearance = compute_team_appearence(frame2, bbox)
-                    pose_kpts, pose_vec = None, None
-
-                    for att in pose_attempts:
-                        pb = pad_bbox(bbox, att['pad'], frame2.shape)
-                        x1, y1, x2, y2 = pb
-                        crop = frame2[y1:y2, x1:x2]
-                        if crop.size == 0: continue
-                        res = pose_model.predict(
-                            crop, conf=att['conf'] or pose_conf_threshold, iou=att['iou'] or pose_iou_threshold,
-                            imgsz=round_to_multiple(max(crop.shape[:2]), 32), device='cuda', verbose=False
-                        )
-                        if res and len(res[0].keypoints.xy) > 0:
-                            k = res[0].keypoints.xy.cpu().numpy()[0]
-                            pose_kpts = k + np.array([x1, y1])
-                            pose_vec = keypoints_to_pose_vec(pose_kpts, bbox)
-                            break
-                    detections2.append({
-                        'bbox': bbox, 'appearance': appearance, 'keypoints': pose_kpts, 'pose_vec': pose_vec
+                    pose_kpts, pose_vec = process_detection_pose(
+                        frame2, bbox, pose_model, pose_attempts, pose_conf_threshold, pose_iou_threshold
+                    )
+                    
+                    current_frame_all_detections2.append({
+                        'bbox': bbox, 'appearance': appearance, 'keypoints': pose_kpts, 'pose_vec': pose_vec, 'score': score
                     })
-        tracks2 = tracker2.update(detections2, frame_id)
+                detections2 = current_frame_all_detections2
+
+        tracks2, _, _ = tracker2.update(detections2, frame_id)
         frame_events2 = tracker2.get_frame_events()
         for event in frame_events2:
             event['view'] = 2 # add view identifier
-            csv_writer2.writerow(event) # Changed to csv_writer2
+            csv_writer2.writerow(event)
             
         # --- Cross-view synchronization (placeholder) ---
         # This is where we'd implement logic to match tracks between view1 and view2
@@ -378,45 +424,47 @@ def yolo_sahi_pose_tracking(
         for t in tracks1:
             if not t['updated']:
                 continue
-            x1, y1, x2, y2 = t['bbox']
+            x1, y1, x2, y2 = map(int, t['bbox'])
             tid = t['track_id']
             col = (tid * 37 % 255, tid * 17 % 255, tid * 97 % 255)
             cv.rectangle(out1, (x1, y1), (x2, y2), col, 2)
             if t.get('keypoints') is not None:
+                kpts = t['keypoints'].astype(int)  # Convert once for all operations
                 for a, b in connections:
-                    p1, p2 = t['keypoints'][a], t['keypoints'][b]
+                    p1, p2 = kpts[a], kpts[b]
                     if p1[0] > 0 and p2[0] > 0:
-                        cv.line(out1, tuple(p1.astype(int)), tuple(p2.astype(int)), col, 2)
-                for p in t['keypoints']:
+                        cv.line(out1, tuple(p1), tuple(p2), col, 2)
+                for p in kpts:
                     if p[0] > 0:
-                        cv.circle(out1, tuple(p.astype(int)), 3, col, -1)
-                        cv.circle(out1, tuple(p.astype(int)), 3, (255, 255, 255), 1)
-                head = t['keypoints'][0]
-                cv.putText(out1, f'ID:{tid}', (int(head[0]), int(head[1]) - 10), cv.FONT_HERSHEY_SIMPLEX, 0.6, col, 2)
+                        cv.circle(out1, tuple(p), 3, col, -1)
+                        cv.circle(out1, tuple(p), 3, (255, 255, 255), 1)
+                head = kpts[0]
+                cv.putText(out1, f'ID:{tid}', (head[0], head[1] - 10), cv.FONT_HERSHEY_SIMPLEX, 0.6, col, 2)
 
         out2 = roi2.copy()
         for t in tracks2:
             if not t['updated']:
                 continue
-            x1, y1, x2, y2 = t['bbox']
+            x1, y1, x2, y2 = map(int, t['bbox'])
             tid = t['track_id']
             col = (tid * 37 % 255, tid * 17 % 255, tid * 97 % 255)
             cv.rectangle(out2, (x1, y1), (x2, y2), col, 2)
             if t.get('keypoints') is not None:
+                kpts = t['keypoints'].astype(int)  # Convert once for all operations
                 for a, b in connections:
-                    p1, p2 = t['keypoints'][a], t['keypoints'][b]
+                    p1, p2 = kpts[a], kpts[b]
                     if p1[0] > 0 and p2[0] > 0:
-                        cv.line(out2, tuple(p1.astype(int)), tuple(p2.astype(int)), col, 2)
-                for p in t['keypoints']:
+                        cv.line(out2, tuple(p1), tuple(p2), col, 2)
+                for p in kpts:
                     if p[0] > 0:
-                        cv.circle(out2, tuple(p.astype(int)), 3, col, -1)
-                        cv.circle(out2, tuple(p.astype(int)), 3, (255, 255, 255), 1)
-                head = t['keypoints'][0]
-                cv.putText(out2, f'ID:{tid}', (int(head[0]), int(head[1]) - 10), cv.FONT_HERSHEY_SIMPLEX, 0.6, col, 2)
+                        cv.circle(out2, tuple(p), 3, col, -1)
+                        cv.circle(out2, tuple(p), 3, (255, 255, 255), 1)
+                head = kpts[0]
+                cv.putText(out2, f'ID:{tid}', (head[0], head[1] - 10), cv.FONT_HERSHEY_SIMPLEX, 0.6, col, 2)
 
         dt = time.time() - start_time
         fps_hist.append(1 / dt if dt > 0 else 0)
-        fps_avg = sum(fps_hist[-30:]) / len(fps_hist[-30:])
+        fps_avg = sum(fps_hist) / len(fps_hist) if fps_hist else 0
         draw_text_with_bg(out1, f'FPS {int(fps_avg)}', (30, 50))
         draw_text_with_bg(out1, f'Frame {frame_id}', (30, 100))
         draw_text_with_bg(out2, f'FPS {int(fps_avg)}', (30, 50))
@@ -442,10 +490,10 @@ def yolo_sahi_pose_tracking(
 
 if __name__ == '__main__':
     yolo_sahi_pose_tracking(
-        source1='video raw/video-20260119T131608Z-1-004/video/tracking_12/out4.mp4',
-        source2='video raw/video-20260119T131608Z-1-004/video/tracking_12/out13.mp4',
-        initial_annotations_path1='tracking_12.v2i.yolov11/train/labels/out4_frame_0001_png.rf.13ad8a164866d2d0e8151ff7a71f7908.txt',
-        initial_annotations_path2='tracking_12.v2i.yolov11/train/labels/out13_frame_0001_png.rf.68fc7ed57b749ab73105139ae9ec4f7e.txt',
+        source1='Tracking/material4project/Rectified videos/tracking_12/out4.mp4',
+        source2='Tracking/material4project/Rectified videos/tracking_12/out13.mp4',
+        initial_annotations_path1='tracking_12.v2i.yolov11/train/labels/out4_frame_0001_png.rf.13ad8a164866d2d0e8151ff7a71f7908_rectified.txt',
+        initial_annotations_path2='tracking_12.v2i.yolov11/train/labels/out13_frame_0001_png.rf.68fc7ed57b749ab73105139ae9ec4f7e_rectified.txt',
         output_path1='output_view1.mp4',
         output_path2='output_view2.mp4',
     )

@@ -22,12 +22,14 @@ def iou(b1, b2):
 class IOUTracker:
     def __init__(self,
                  match_threshold=0.35,
+                 cross_view_match_threshold=0.5, # new: threshold for cross-view matching
                  max_missed_frames=10,
                  iou_weight=0.5,
                  appearance_weight=0.35,
                  pose_weight=0.15,
                  ema_alpha=0.9):
         self.match_threshold = match_threshold
+        self.cross_view_match_threshold = cross_view_match_threshold # new
         self.max_missed = max_missed_frames
         self.iou_w = iou_weight
         self.app_w = appearance_weight
@@ -47,6 +49,9 @@ class IOUTracker:
             'temporary_missed_tracks': 0,
             'active_tracks': 0,
         }
+        self.track_to_global_id = {} # maps local track_id to a global_id
+        self.global_id_to_track = {} # maps global_id to actual track objects
+        self.next_global_id = 0
 
     def _appearance_sim(self, a, b):
         if a is None or b is None:
@@ -56,8 +61,11 @@ class IOUTracker:
     def _pose_sim(self, p1, p2):
         if p1 is None or p2 is None:
             return 0.0
+        # for pose, a smaller distance means higher similarity.
+        # we can convert distance to similarity using an exponential decay.
         d = np.linalg.norm(p1 - p2)
-        return float(np.exp(-d))
+        # adjust the decay factor (e.g., 0.1) based on expected pose variations
+        return float(np.exp(-0.1 * d))
 
     def _cost_matrix(self, detections):
         n_t = len(self.tracks)
@@ -76,76 +84,28 @@ class IOUTracker:
                 cost[i, j] = 1.0 - sim
         return cost
 
-    def update(self, detections, frame_id): # new: accept frame_id
-        self.current_frame_events = [] # clear events for the new frame
-        self.current_frame_statistics = { # reset per-frame statistics
-            'added_tracks': 0,
-            'lost_tracks': 0,
-            'refound_tracks': 0,
-            'temporary_missed_tracks': 0,
-            'active_tracks': 0,
-        }
-        
-        for t in self.tracks:
-            t['updated'] = False
-            t['was_refound_in_this_frame'] = False # new: track if refound in this frame
+    # new: method to compute cross-view similarity
+    def _cross_view_similarity(self, track_a, track_b):
+        # combine appearance and pose similarities,
+        # assuming no direct IoU for cross-view unless projected
+        app_sim = self._appearance_sim(track_a.get('appearance'), track_b.get('appearance'))
+        pose_sim = self._pose_sim(track_a.get('pose_vec'), track_b.get('pose_vec'))
 
-        if len(self.tracks) == 0:
-            for d in detections:
-                self._start_track(d, frame_id)
-            self._prune(frame_id) # ensure pruning happens even for first frame
-            self.current_frame_statistics['active_tracks'] = len(self.tracks)
-            self.total_active_tracks = len(self.tracks)
-            return self.tracks
+        # you might want to adjust weights for cross-view if they differ from single-view
+        # for example, appearance might be more reliable than pose across views due to perspective changes
+        # this is a starting point, tuning these weights will be crucial
+        cross_sim = (0.6 * app_sim + 0.4 * pose_sim) # example weights
 
-        if len(detections) == 0:
-            for t in self.tracks:
-                t['missed'] += 1
-                if t['missed'] > 0 and t['missed'] <= self.max_missed:
-                    self.current_frame_events.append({'frame': frame_id, 'track_id': t['track_id'], 'event': 'temporary_missed'})
-                    self.current_frame_statistics['temporary_missed_tracks'] += 1
-                    self.total_temporary_missed_frames += 1
-            self._prune(frame_id)
-            self.current_frame_statistics['active_tracks'] = len(self.tracks)
-            self.total_active_tracks = len(self.tracks)
-            return self.tracks
+        return cross_sim
+    
+    def _start_track(self, det, frame_id, global_id=None):
+        if global_id is None:
+            global_id = self.next_global_id
+            self.next_global_id += 1
 
-        cost = self._cost_matrix(detections)
-        row_ind, col_ind = linear_sum_assignment(cost)
-
-        matched_tracks = set()
-        matched_dets = set()
-
-        for r, c in zip(row_ind, col_ind):
-            if cost[r, c] <= (1.0 - self.match_threshold):
-                self._update_track(self.tracks[r], detections[c], frame_id) # new: pass frame_id
-                matched_tracks.add(r)
-                matched_dets.add(c)
-
-        # unmatched tracks
-        for i, t in enumerate(self.tracks):
-            if i not in matched_tracks:
-                t['missed'] += 1
-                if t['missed'] > 0 and t['missed'] <= self.max_missed:
-                    self.current_frame_events.append({'frame': frame_id, 'track_id': t['track_id'], 'event': 'temporary_missed'})
-                    self.current_frame_statistics['temporary_missed_tracks'] += 1
-                    self.total_temporary_missed_frames += 1
-
-
-        # new tracks
-        for j, d in enumerate(detections):
-            if j not in matched_dets:
-                self._start_track(d, frame_id)
-
-        self._prune(frame_id)
-        
-        self.current_frame_statistics['active_tracks'] = len(self.tracks)
-        self.total_active_tracks = len(self.tracks)
-        return self.tracks
-
-    def _start_track(self, det, frame_id):
         new_track = {
             'track_id': self.next_id,
+            'global_id': global_id, # associate with a global ID
             'bbox': det['bbox'],
             'appearance': det.get('appearance'),
             'pose_vec': det.get('pose_vec'),
@@ -155,14 +115,18 @@ class IOUTracker:
             'was_refound_in_this_frame': False # new: initial state
         }
         self.tracks.append(new_track)
-        self.current_frame_events.append({'frame': frame_id, 'track_id': self.next_id, 'event': 'added'})
+        self.track_to_global_id[self.next_id] = global_id
+        self.global_id_to_track[global_id] = new_track # keep a reference to the track object
+        self.current_frame_events.append({'frame': frame_id, 'track_id': self.next_id, 'event': 'added', 'global_id': global_id})
         self.current_frame_statistics['added_tracks'] += 1
         self.next_id += 1
+        return new_track # return the new track object
+
 
     def _update_track(self, track, det, frame_id): # new: accept frame_id
         # if this track was previously missed, it's now refound
         if track['missed'] > 0:
-            self.current_frame_events.append({'frame': frame_id, 'track_id': track['track_id'], 'event': 'refound'})
+            self.current_frame_events.append({'frame': frame_id, 'track_id': track['track_id'], 'event': 'refound', 'global_id': track['global_id']})
             self.current_frame_statistics['refound_tracks'] += 1
             self.total_refound_tracks += 1
             track['was_refound_in_this_frame'] = True # mark as refound
@@ -189,9 +153,15 @@ class IOUTracker:
             if t['missed'] <= self.max_missed:
                 retained_tracks.append(t)
             else:
-                self.current_frame_events.append({'frame': frame_id, 'track_id': t['track_id'], 'event': 'lost'})
+                self.current_frame_events.append({'frame': frame_id, 'track_id': t['track_id'], 'event': 'lost', 'global_id': t['global_id']})
                 self.current_frame_statistics['lost_tracks'] += 1
+                # Remove from global_id mappings if the track is truly lost
+                if t['global_id'] in self.global_id_to_track:
+                    del self.global_id_to_track[t['global_id']]
+                if t['track_id'] in self.track_to_global_id:
+                    del self.track_to_global_id[t['track_id']]
         self.tracks = retained_tracks
+
 
     def get_frame_events(self):
         return self.current_frame_events
@@ -206,3 +176,130 @@ class IOUTracker:
             'total_active_tracks_last_frame': self.total_active_tracks,
             'current_tracked_objects': len(self.tracks)
         }
+
+    # Main update logic
+    def update(self, detections, frame_id): # new: accept frame_id
+        self.current_frame_events = [] # clear events for the new frame
+        self.current_frame_statistics = { # reset per-frame statistics
+            'added_tracks': 0,
+            'lost_tracks': 0,
+            'refound_tracks': 0,
+            'temporary_missed_tracks': 0,
+            'active_tracks': 0,
+        }
+        
+        for t in self.tracks:
+            t['updated'] = False
+            t['was_refound_in_this_frame'] = False # new: track if refound in this frame
+
+        if len(self.tracks) == 0:
+            for d in detections:
+                self._start_track(d, frame_id)
+            self._prune(frame_id) # ensure pruning happens even for first frame
+            self.current_frame_statistics['active_tracks'] = len(self.tracks)
+            self.total_active_tracks = len(self.tracks)
+            return self.tracks, [], detections # Return tracks, matched_global_ids, unmatched_detections
+
+        if len(detections) == 0:
+            for t in self.tracks:
+                t['missed'] += 1
+                if t['missed'] > 0 and t['missed'] <= self.max_missed:
+                    self.current_frame_events.append({'frame': frame_id, 'track_id': t['track_id'], 'event': 'temporary_missed', 'global_id': t['global_id']})
+                    self.current_frame_statistics['temporary_missed_tracks'] += 1
+                    self.total_temporary_missed_frames += 1
+            self._prune(frame_id)
+            self.current_frame_statistics['active_tracks'] = len(self.tracks)
+            self.total_active_tracks = len(self.tracks)
+            return self.tracks, [], detections # Return tracks, matched_global_ids, unmatched_detections
+
+        cost = self._cost_matrix(detections)
+        row_ind, col_ind = linear_sum_assignment(cost)
+
+        matched_tracks_indices = set()
+        matched_dets_indices = set()
+        matched_global_ids = []
+
+        for r, c in zip(row_ind, col_ind):
+            if cost[r, c] <= (1.0 - self.match_threshold):
+                self._update_track(self.tracks[r], detections[c], frame_id) # new: pass frame_id
+                matched_tracks_indices.add(r)
+                matched_dets_indices.add(c)
+                matched_global_ids.append(self.tracks[r]['global_id'])
+
+
+        # unmatched tracks (potential lost or temporary missed)
+        for i, t in enumerate(self.tracks):
+            if i not in matched_tracks_indices:
+                t['missed'] += 1
+                if t['missed'] > 0 and t['missed'] <= self.max_missed:
+                    self.current_frame_events.append({'frame': frame_id, 'track_id': t['track_id'], 'event': 'temporary_missed', 'global_id': t['global_id']})
+                    self.current_frame_statistics['temporary_missed_tracks'] += 1
+                    self.total_temporary_missed_frames += 1
+
+
+        # unmatched detections (potential new tracks or cross-view matches)
+        unmatched_detections = []
+        for j, d in enumerate(detections):
+            if j not in matched_dets_indices:
+                unmatched_detections.append(d)
+
+        self._prune(frame_id)
+        
+        self.current_frame_statistics['active_tracks'] = len(self.tracks)
+        self.total_active_tracks = len(self.tracks)
+        return self.tracks, matched_global_ids, unmatched_detections
+
+    def assign_cross_view_tracks(self, other_tracker_active_tracks, current_view_unmatched_detections, frame_id):
+        # build a list of tracks from the other view that are not yet matched
+        # (i.e. tracks that might represent an object also seen in current view's unmatched detections)
+        
+        cross_view_matches = []
+        matched_other_view_tracks_indices = set()
+        matched_current_dets_indices = set()
+
+        if not other_tracker_active_tracks or not current_view_unmatched_detections:
+            return current_view_unmatched_detections # No new matches if no tracks or no unmatched detections
+
+        cross_cost_matrix = np.zeros((len(other_tracker_active_tracks), len(current_view_unmatched_detections)), dtype=np.float32)
+
+        for i, other_track in enumerate(other_tracker_active_tracks):
+            for j, current_det in enumerate(current_view_unmatched_detections):
+                # use a similarity based on appearance and pose between tracks from different views
+                sim = self._cross_view_similarity(other_track, current_det) # Assuming detection has track-like attributes
+                cross_cost_matrix[i, j] = 1.0 - sim
+
+        row_ind, col_ind = linear_sum_assignment(cross_cost_matrix)
+
+        newly_matched_current_view_detections = []
+        for r, c in zip(row_ind, col_ind):
+            if cross_cost_matrix[r, c] <= (1.0 - self.cross_view_match_threshold):
+                other_track = other_tracker_active_tracks[r]
+                current_det = current_view_unmatched_detections[c]
+                
+                # Assign the global_id from the other track to the new track created from current_det
+                new_track_obj = self._start_track(current_det, frame_id, global_id=other_track['global_id'])
+                cross_view_matches.append({
+                    'current_view_track_id': new_track_obj['track_id'],
+                    'other_view_track_id': other_track['track_id'],
+                    'global_id': other_track['global_id']
+                })
+                matched_other_view_tracks_indices.add(r)
+                matched_current_dets_indices.add(c)
+                self.current_frame_events.append({
+                    'frame': frame_id,
+                    'track_id': new_track_obj['track_id'],
+                    'event': 'cross_view_match_found',
+                    'global_id': new_track_obj['global_id'],
+                    'matched_with_other_view_track_id': other_track['track_id']
+                })
+
+        # detections that were unmatched even after cross-view matching will start new tracks
+        remaining_unmatched_detections = []
+        for j, det in enumerate(current_view_unmatched_detections):
+            if j not in matched_current_dets_indices:
+                remaining_unmatched_detections.append(det)
+
+        for det in remaining_unmatched_detections:
+            self._start_track(det, frame_id)
+
+        return cross_view_matches
