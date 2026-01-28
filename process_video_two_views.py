@@ -22,8 +22,8 @@ TRAPEZ_BOTTOM_RIGHT_1 = (1440, 810)
 CURVE_HEIGHT_1 = 0
 
 # Mask for View 2 (Placeholder values, adjust as needed)
-TRAPEZ_TOP_LEFT_2 = (200, 310)
-TRAPEZ_TOP_RIGHT_2 = (1240, 310)
+TRAPEZ_TOP_LEFT_2 = (200, 330)
+TRAPEZ_TOP_RIGHT_2 = (1240, 330)
 TRAPEZ_BOTTOM_LEFT_2 = (0, 665)
 TRAPEZ_BOTTOM_RIGHT_2 = (1440, 665)
 CURVE_HEIGHT_2 = 65
@@ -123,8 +123,10 @@ def draw_text_with_bg(img, text, pos, scale=0.6):
 
 # new function to parse YOLO annotations
 def parse_yolo_annotations(anno_file, img_width, img_height, frame, pose_model, pose_attempts, pose_conf_threshold, pose_iou_threshold, tracker=None):
+    print(f"DEBUG: Attempting to parse {anno_file}")
     detections = []
-    if not anno_file: # Handle cases where annotation file might be None
+    if not os.path.exists(anno_file):
+        print(f"ERROR: Annotation file does not exist: {anno_file}")
         return detections
     try:
         lines_read = 0
@@ -133,6 +135,7 @@ def parse_yolo_annotations(anno_file, img_width, img_height, frame, pose_model, 
                 lines_read += 1
                 parts = line.strip().split(' ')
                 if len(parts) < 5:
+                    print(f"DEBUG: Skipping short line: {line.strip()}")
                     continue  # Skip invalid lines
                 class_id = int(parts[0])
                 # Process all annotations (class_id can be any value - player IDs, object types, etc.)
@@ -160,7 +163,8 @@ def parse_yolo_annotations(anno_file, img_width, img_height, frame, pose_model, 
                     'keypoints': pose_kpts,
                     'pose_vec': pose_vec,
                     'world_pos': world_pos,
-                    'score': 1.0 # Assign a high score for initial annotations
+                    'score': 1.0, # Assign a high score for initial annotations
+                    'global_id': class_id # Use class_id from annotation file
                 })
         print(f"  Parsed {lines_read} lines from annotation file, created {len(detections)} detections")
     except FileNotFoundError:
@@ -170,6 +174,80 @@ def parse_yolo_annotations(anno_file, img_width, img_height, frame, pose_model, 
         import traceback
         traceback.print_exc()
     return detections
+
+def draw_tracks(img, tracks, size, max_tracks, connections, tracker_self, other_tracks=None, other_view_name="V2"):
+    """
+    Helper function to draw tracks, keypoints and cross-view projections on a frame.
+    """
+    # Show any track that is currently tracked (within missed frame tolerance)
+    valid_tracks = [t for t in tracks if t['missed'] <= tracker_self.max_missed]
+    
+    # Filter by FOV
+    valid_tracks_filtered = []
+    for t in valid_tracks:
+        x1, y1, x2, y2 = t['bbox']
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        
+        # If the track is being deduced or is temporarily missed, we only draw it 
+        # if its predicted/last-known center is within the current frame view.
+        if t.get('was_deduced') or t['missed'] > 0:
+            if not (0 <= cx < size[0] and 0 <= cy < size[1]):
+                continue
+        valid_tracks_filtered.append(t)
+    
+    # Sort by ID to keep colors consistent
+    valid_tracks_filtered.sort(key=lambda x: x['global_id'])
+    
+    # Draw primary tracks for this view
+    for t in valid_tracks_filtered:
+        x1, y1, x2, y2 = map(int, t['bbox'])
+        gid = t['global_id']
+        col = (gid * 37 % 255, gid * 17 % 255, gid * 97 % 255)
+        
+        # Rectangle for player
+        # Use dashed or thinner lines for deduced/missed tracks
+        thickness = 1 if (t.get('was_deduced') or t['missed'] > 0) else 2
+        cv.rectangle(img, (x1, y1), (x2, y2), col, thickness)
+        
+        if t.get('keypoints') is not None:
+            kpts = t['keypoints'].astype(int)
+            for a, b in connections:
+                p1, p2 = kpts[a], kpts[b]
+                if p1[0] > 0 and p2[0] > 0:
+                    cv.line(img, tuple(p1), tuple(p2), col, thickness)
+            for p in kpts:
+                if p[0] > 0:
+                    cv.circle(img, tuple(p), 3, col, -1)
+                    cv.circle(img, tuple(p), 3, (255, 255, 255), 1)
+            head = kpts[0]
+            label = f'GID:{gid}' + (' (D)' if t.get('was_deduced') else '')
+            cv.putText(img, label, (head[0], head[1] - 10), cv.FONT_HERSHEY_SIMPLEX, 0.6, col, 2)
+
+    # Draw projections from other view if applicable
+    if other_tracks:
+        for t_other in other_tracks:
+            # Only project tracks that were actually detected (not deduced) in the other view
+            if t_other['updated'] and not t_other.get('was_deduced'):
+                gid = t_other['global_id']
+                world_pos = t_other['world_pos']
+                if world_pos is None: continue
+                
+                pixel_pos = tracker_self.project_to_pixel(world_pos)
+                if pixel_pos is not None:
+                    px, py = map(int, pixel_pos)
+                    if 0 <= px < size[0] and 0 <= py < size[1]:
+                        col = (gid * 37 % 255, gid * 17 % 255, gid * 97 % 255)
+                        
+                        # Use dimensions from local track if available, else default
+                        tw, th = 40, 80
+                        if gid in tracker_self.global_id_to_track:
+                            lx1, ly1, lx2, ly2 = tracker_self.global_id_to_track[gid]['bbox']
+                            tw, th = lx2 - lx1, ly2 - ly1
+                        
+                        cv.rectangle(img, (px - tw//2, py - th), (px + tw//2, py), col, 1)
+                        cv.putText(img, f"{other_view_name}-GID:{gid}", (px - tw//2, py - th - 5), 
+                                   cv.FONT_HERSHEY_SIMPLEX, 0.4, col, 1)
+    return img
 
 # ================= MAIN =================
 
@@ -182,24 +260,24 @@ def load_calibration(calib_path):
 
 def yolo_sahi_pose_tracking(
     source1,
-    source2, # new argument for the second video source
+    source2,
     calib_path1=None,
     calib_path2=None,
-    initial_annotations_path1=None, # new argument for YOLO annotation file for view 1
-    initial_annotations_path2=None, # new argument for YOLO annotation file for view 2
-    output_path1='yolo_sahi_pose_tracking_view1.mp4', # distinct output paths
-    output_path2='yolo_sahi_pose_tracking_view2.mp4', # distinct output paths
+    initial_annotations_path1=None,
+    initial_annotations_path2=None,
+    output_path1='yolo_sahi_pose_tracking_view1.mp4',
+    output_path2='yolo_sahi_pose_tracking_view2.mp4',
     output_csv_path1='track_events_view1.csv',
     output_csv_path2='track_events_view2.csv',
     size=(1440, 810),
     # detection View 1
-    sahi_conf_threshold1=0.45, # More restrictive for View 1
-    sahi_iou_threshold1=0.50,
+    sahi_conf_threshold1=0.45,
+    sahi_iou_threshold1=0.55,
     slice_h1=640,
     slice_w1=640,
-    slice_overlap1=0.37,
+    slice_overlap1=0.15,
     # pose View 1
-    pose_conf_threshold1=0.15, # More restrictive for View 1
+    pose_conf_threshold1=0.15,
     pose_iou_threshold1=0.02,
     pose_attempts1=(
         {'pad': 0.0, 'conf': None, 'iou': None},
@@ -212,6 +290,7 @@ def yolo_sahi_pose_tracking(
     pose_weight1=0.33,
     max_missed_frames1=60,
     ema_alpha1=0.9,
+    max_velocity1=400.0, # max units moved per frame for View 1
     # detection View 2
     sahi_conf_threshold2=0.25,
     sahi_iou_threshold2=0.50,
@@ -227,12 +306,46 @@ def yolo_sahi_pose_tracking(
     ),
     # tracker View 2
     match_threshold2=0.25,
-    iou_weight2=0.27,
+    iou_weight2=0.30,
     appearance_weight2=0.45,
     pose_weight2=0.33,
     max_missed_frames2=60,
-    ema_alpha2=0.9
+    ema_alpha2=0.9,
+    max_velocity2=400.0 # max units moved per frame for View 2
 ):
+    """
+    Main pipeline for multi-view person tracking using YOLO, SAHI, and Pose estimation.
+    
+    Parameters:
+        source1, source2: Paths to the input video files for view 1 and view 2.
+        calib_path1, calib_path2: Paths to JSON files containing camera calibration parameters.
+        initial_annotations_path1, 2: Paths to YOLO-format txt files for the first frame.
+                                      Used to bootstrap tracking with known positions.
+        output_path1, 2: Filenames for the processed output videos.
+        output_csv_path1, 2: Filenames for saving track events (add, lost, refound).
+        size: Tuple (width, height) to which input frames are resized.
+        
+        SAHI Parameters (sahi_conf, sahi_iou, slice_h, slice_w, slice_overlap):
+            - sahi_conf_threshold: Confidence threshold for person detection in slices.
+            - sahi_iou_threshold: IoU threshold for NMS after merging slice predictions.
+            - slice_h, slice_w: Dimensions of the slices for SAHI.
+            - slice_overlap: Overlap ratio between adjacent slices.
+            
+        Pose Parameters (pose_conf, pose_iou, pose_attempts):
+            - pose_conf_threshold: Minimum confidence for keypoint detection.
+            - pose_attempts: List of dictionaries defining padding and thresholds for multiple 
+                             pose estimation retries if the first one fails.
+                             
+        Tracker Parameters (match_threshold, weights, max_missed, ema_alpha):
+            - match_threshold: Minimum similarity to maintain a track.
+            - iou_weight: Importance of bounding box overlap.
+            - appearance_weight: Importance of visual similarity.
+            - pose_weight: Importance of pose consistency.
+            - max_missed_frames: Grace period for a track before it is considered lost.
+            - ema_alpha: Update rate for the appearance feature vector.
+            - max_velocity: Maximum physical distance a person can travel between frames.
+                           Used to prevent physically impossible re-identifications.
+    """
     # skeleton connections (YOLO format)
     connections = [
         (0,1),(0,2),(1,3),(2,4),
@@ -264,6 +377,7 @@ def yolo_sahi_pose_tracking(
         appearance_weight=appearance_weight1,
         pose_weight=pose_weight1,
         ema_alpha=ema_alpha1,
+        max_velocity=max_velocity1,
         camera_params=calib1,
         global_id_manager=shared_id_manager
     )
@@ -274,6 +388,7 @@ def yolo_sahi_pose_tracking(
         appearance_weight=appearance_weight2,
         pose_weight=pose_weight2,
         ema_alpha=ema_alpha2,
+        max_velocity=max_velocity2,
         camera_params=calib2,
         global_id_manager=shared_id_manager
     )
@@ -317,7 +432,7 @@ def yolo_sahi_pose_tracking(
     ok1, frame1 = cap1.read()
     ok2, frame2 = cap2.read()
     if not (ok1 and ok2):
-        print("error: could not read initial frames from both videos.")
+        print(f"error: could not read initial frames. cap1: {ok1}, cap2: {ok2}")
         return
 
     frame1 = cv.resize(frame1, size)
@@ -335,15 +450,59 @@ def yolo_sahi_pose_tracking(
         initial_annotations_path2, size[0], size[1], frame2, pose_model, pose_attempts2, pose_conf_threshold2, pose_iou_threshold2, tracker=tracker2
     )
 
-    # Store initial counts
-    max_tracks_view1 = len(initial_detections1)
-    max_tracks_view2 = len(initial_detections2)
-    print(f"view 1: {max_tracks_view1} initial tracks detected.")
-    print(f"view 2: {max_tracks_view2} initial tracks detected.")
+    # Store initial counts and IDs
+    all_initial_gids = set([d['global_id'] for d in initial_detections1] + [d['global_id'] for d in initial_detections2])
+    max_total_players = len(all_initial_gids)
+    
+    if max_total_players == 0:
+        print("warning: No players found in initial annotations. Relaxing max_tracks to 25.")
+        max_total_players = 25 # Default fallback
+    else:
+        print(f"Total unique players in first frame: {max_total_players}")
+    
+    # Update trackers with max_tracks
+    tracker1.max_tracks = max_total_players
+    tracker2.max_tracks = max_total_players
 
+    tracks1, _, _ = tracker1.update(initial_detections1, frame_id, finalize=True)
+    tracks2, _, unmatched2 = tracker2.update(initial_detections2, frame_id, finalize=False)
+    
+    # Cross-view matching for the first frame to ensure shared GIDs from the start
+    tracker2.assign_cross_view_tracks([t for t in tracks1 if t['updated']], unmatched2, frame_id)
+    
+    # Triangulate initial frame
+    for gid in all_initial_gids:
+        if gid in tracker1.global_id_to_track and gid in tracker2.global_id_to_track:
+            t1 = tracker1.global_id_to_track[gid]
+            t2 = tracker2.global_id_to_track[gid]
+            if t1['updated'] and t2['updated']:
+                p3d = IOUTracker.triangulate(tracker1, tracker2, t1['bbox'], t2['bbox'])
+                if p3d is not None:
+                    t1['world_pos'] = p3d
+                    t2['world_pos'] = p3d
 
-    tracks1, _, _ = tracker1.update(initial_detections1, frame_id)
-    tracks2, _, _ = tracker2.update(initial_detections2, frame_id)
+    # Log initial events to CSV
+    for event in tracker1.get_frame_events():
+        event['view'] = 1
+        csv_writer1.writerow(event)
+    for event in tracker2.get_frame_events():
+        event['view'] = 2
+        csv_writer2.writerow(event)
+
+    # Refresh tracks2 after cross-view matching
+    tracks2 = tracker2.tracks
+
+    # Save first processed frame
+    roi1 = apply_trapezoid_mask(frame1, mask1)
+    roi2 = apply_trapezoid_mask(frame2, mask2)
+    
+    out1 = draw_tracks(roi1.copy(), tracks1, size, max_total_players, connections, tracker1, 
+                       other_tracks=tracks2, other_view_name="V2")
+    out2 = draw_tracks(roi2.copy(), tracks2, size, max_total_players, connections, tracker2, 
+                       other_tracks=tracks1, other_view_name="V1")
+
+    writer1.write(out1)
+    writer2.write(out2)
 
     # Main loop for subsequent frames
     while cap1.isOpened() and cap2.isOpened():
@@ -360,7 +519,6 @@ def yolo_sahi_pose_tracking(
 
         # --- Process View 1 ---
         roi1 = apply_trapezoid_mask(frame1, mask1)
-        # Optimized: use np.any along axis for faster ROI bounds calculation
         mask_1d = np.any(roi1 > 0, axis=2)
         detections1 = []
         if np.any(mask_1d):
@@ -376,39 +534,26 @@ def yolo_sahi_pose_tracking(
             )
 
             if preds1 and preds1.object_prediction_list:
-                # Pre-filter and sort by score before processing
-                valid_preds = [(p, p.score.value) for p in preds1.object_prediction_list 
-                              if p.category.id == 0 and p.score.value >= sahi_conf_threshold1]
-                valid_preds.sort(key=lambda x: x[1], reverse=True)
-                valid_preds = valid_preds[:max_tracks_view1]  # Limit before expensive operations
-                
-                current_frame_all_detections1 = []
-                for p, score in valid_preds:
-                    bx1, by1, bx2, by2 = map(int, p.bbox.to_xyxy())
-                    bbox = (bx1 + min_x1, by1 + min_y1, bx2 + min_x1, by2 + min_y1)
-                    
-                    # Process appearance and pose in parallel (appearance is fast, pose is slow)
-                    appearance = compute_team_appearence(frame1, bbox)
-                    pose_kpts, pose_vec = process_detection_pose(
-                        frame1, bbox, pose_model, pose_attempts1, pose_conf_threshold1, pose_iou_threshold1
-                    )
-                    
-                    world_pos = tracker1.project_to_world(bbox)
+                for p in preds1.object_prediction_list:
+                    if p.category.id == 0 and p.score.value >= sahi_conf_threshold1:
+                        bx1, by1, bx2, by2 = map(int, p.bbox.to_xyxy())
+                        # CRITICAL: Map back to full frame coordinates correctly
+                        bbox = (bx1 + min_x1, by1 + min_y1, bx2 + min_x1, by2 + min_y1)
+                        
+                        appearance = compute_team_appearence(frame1, bbox)
+                        pose_kpts, pose_vec = process_detection_pose(
+                            frame1, bbox, pose_model, pose_attempts1, pose_conf_threshold1, pose_iou_threshold1
+                        )
+                        world_pos = tracker1.project_to_world(bbox)
 
-                    current_frame_all_detections1.append({
-                        'bbox': bbox, 'appearance': appearance, 'keypoints': pose_kpts, 'pose_vec': pose_vec, 'world_pos': world_pos, 'score': score
-                    })
-                detections1 = current_frame_all_detections1
-
+                        detections1.append({
+                            'bbox': bbox, 'appearance': appearance, 'keypoints': pose_kpts, 'pose_vec': pose_vec, 'world_pos': world_pos, 'score': p.score.value
+                        })
+        
         tracks1, matched_ids1, unmatched1 = tracker1.update(detections1, frame_id, finalize=False)
-        frame_events1 = tracker1.get_frame_events()
-        for event in frame_events1:
-            event['view'] = 1 # add view identifier
-            csv_writer1.writerow(event)
 
         # --- Process View 2 ---
         roi2 = apply_trapezoid_mask(frame2, mask2)
-        # Optimized: use np.any along axis for faster ROI bounds calculation
         mask_2d = np.any(roi2 > 0, axis=2)
         detections2 = []
         if np.any(mask_2d):
@@ -424,65 +569,58 @@ def yolo_sahi_pose_tracking(
             )
 
             if preds2 and preds2.object_prediction_list:
-                # Pre-filter and sort by score before processing
-                valid_preds = [(p, p.score.value) for p in preds2.object_prediction_list 
-                              if p.category.id == 0 and p.score.value >= sahi_conf_threshold2]
-                valid_preds.sort(key=lambda x: x[1], reverse=True)
-                valid_preds = valid_preds[:max_tracks_view2]  # Limit before expensive operations
-                
-                current_frame_all_detections2 = []
-                for p, score in valid_preds:
-                    bx1, by1, bx2, by2 = map(int, p.bbox.to_xyxy())
-                    bbox = (bx1 + min_x2, by1 + min_y2, bx2 + min_x2, by2 + min_y2)
-                    
-                    # Process appearance and pose
-                    appearance = compute_team_appearence(frame2, bbox)
-                    pose_kpts, pose_vec = process_detection_pose(
-                        frame2, bbox, pose_model, pose_attempts2, pose_conf_threshold2, pose_iou_threshold2
-                    )
-                    
-                    world_pos = tracker2.project_to_world(bbox)
+                for p in preds2.object_prediction_list:
+                    if p.category.id == 0 and p.score.value >= sahi_conf_threshold2:
+                        bx1, by1, bx2, by2 = map(int, p.bbox.to_xyxy())
+                        bbox = (bx1 + min_x2, by1 + min_y2, bx2 + min_x2, by2 + min_y2)
+                        
+                        appearance = compute_team_appearence(frame2, bbox)
+                        pose_kpts, pose_vec = process_detection_pose(
+                            frame2, bbox, pose_model, pose_attempts2, pose_conf_threshold2, pose_iou_threshold2
+                        )
+                        world_pos = tracker2.project_to_world(bbox)
 
-                    current_frame_all_detections2.append({
-                        'bbox': bbox, 'appearance': appearance, 'keypoints': pose_kpts, 'pose_vec': pose_vec, 'world_pos': world_pos, 'score': score
-                    })
-                detections2 = current_frame_all_detections2
-
+                        detections2.append({
+                            'bbox': bbox, 'appearance': appearance, 'keypoints': pose_kpts, 'pose_vec': pose_vec, 'world_pos': world_pos, 'score': p.score.value
+                        })
+        
         tracks2, matched_ids2, unmatched2 = tracker2.update(detections2, frame_id, finalize=False)
-        frame_events2 = tracker2.get_frame_events()
-        for event in frame_events2:
-            event['view'] = 2 # add view identifier
-            csv_writer2.writerow(event)
             
         # --- Cross-view synchronization ---
         # Try to match unmatched detections from View 1 with active tracks from View 2
         active_tracks2 = [t for t in tracks2 if t['updated']]
         cross_matches1 = tracker1.assign_cross_view_tracks(active_tracks2, unmatched1, frame_id)
-        for event in tracker1.get_frame_events():
-            if event['event'] == 'cross_view_match_found':
-                event['view'] = 1
-                csv_writer1.writerow(event)
 
         # Try to match unmatched detections from View 2 with active tracks from View 1
         active_tracks1 = [t for t in tracks1 if t['updated']]
         cross_matches2 = tracker2.assign_cross_view_tracks(active_tracks1, unmatched2, frame_id)
+
+        # --- Cross-view deduction and triangulation ---
+        for gid in all_initial_gids:
+            t1 = tracker1.global_id_to_track.get(gid)
+            t2 = tracker2.global_id_to_track.get(gid)
+            
+            # If updated in both, triangulate for precision
+            if t1 and t2 and t1['updated'] and t2['updated'] and not t1.get('was_deduced') and not t2.get('was_deduced'):
+                p3d = IOUTracker.triangulate(tracker1, tracker2, t1['bbox'], t2['bbox'])
+                if p3d is not None:
+                    t1['world_pos'] = p3d
+                    t2['world_pos'] = p3d
+            
+            # If missed in one but active in other, deduce
+            elif t1 and t2:
+                if t2['updated'] and not t1['updated']:
+                    tracker1.deduce_track_position(gid, t2['world_pos'], frame_id)
+                elif t1['updated'] and not t2['updated']:
+                    tracker2.deduce_track_position(gid, t1['world_pos'], frame_id)
+
+        # Log all events for this frame to CSV (temporal, cross-view, and deduction)
+        for event in tracker1.get_frame_events():
+            if 'view' not in event: event['view'] = 1
+            csv_writer1.writerow(event)
         for event in tracker2.get_frame_events():
-            if event['event'] == 'cross_view_match_found':
-                event['view'] = 2
-                csv_writer2.writerow(event)
-
-        # --- Cross-view deduction (Deduce missed tracks from the other view) ---
-        # If a track is missed in View 1 but active in View 2, deduce its position in View 1
-        for t2 in active_tracks2:
-            gid = t2['global_id']
-            # Only deduce if View 1 doesn't have it updated
-            tracker1.deduce_track_position(gid, t2['world_pos'], frame_id)
-
-        # If a track is missed in View 2 but active in View 1, deduce its position in View 2
-        for t1 in active_tracks1:
-            gid = t1['global_id']
-            # Only deduce if View 2 doesn't have it updated
-            tracker2.deduce_track_position(gid, t1['world_pos'], frame_id)
+            if 'view' not in event: event['view'] = 2
+            csv_writer2.writerow(event)
 
         # Refresh tracks after cross-view matching and deduction
         tracks1 = tracker1.tracks
@@ -490,84 +628,13 @@ def yolo_sahi_pose_tracking(
 
 
         # --- Drawing and Display ---
-        out1 = roi1.copy()
-        # Cap valid detections to show based on initial annotation count
-        valid_tracks1 = [t for t in tracks1 if t['updated']]
-        
-        # Check FOV for deduced tracks in View 1
-        valid_tracks1_filtered = []
-        for t in valid_tracks1:
-            if t.get('was_deduced'):
-                x1, y1, x2, y2 = t['bbox']
-                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-                if not (0 <= cx < size[0] and 0 <= cy < size[1]):
-                    continue # Out of FOV
-            valid_tracks1_filtered.append(t)
-        
-        valid_tracks1_filtered.sort(key=lambda x: x.get('score', 0), reverse=True)
-        valid_tracks1_filtered = valid_tracks1_filtered[:max_tracks_view1]
-        
-        for t in valid_tracks1_filtered:
-            x1, y1, x2, y2 = map(int, t['bbox'])
-            gid = t['global_id']
-            col = (gid * 37 % 255, gid * 17 % 255, gid * 97 % 255)
-            
-            # Use dashed rectangle or different thickness for deduced tracks
-            thickness = 1 if t.get('was_deduced') else 2
-            cv.rectangle(out1, (x1, y1), (x2, y2), col, thickness)
-            
-            if t.get('keypoints') is not None:
-                kpts = t['keypoints'].astype(int)  # Convert once for all operations
-                for a, b in connections:
-                    p1, p2 = kpts[a], kpts[b]
-                    if p1[0] > 0 and p2[0] > 0:
-                        cv.line(out1, tuple(p1), tuple(p2), col, thickness)
-                for p in kpts:
-                    if p[0] > 0:
-                        cv.circle(out1, tuple(p), 3, col, -1)
-                        cv.circle(out1, tuple(p), 3, (255, 255, 255), 1)
-                head = kpts[0]
-                label = f'GID:{gid}' + (' (D)' if t.get('was_deduced') else '')
-                cv.putText(out1, label, (head[0], head[1] - 10), cv.FONT_HERSHEY_SIMPLEX, 0.6, col, 2)
+        roi1 = apply_trapezoid_mask(frame1, mask1)
+        roi2 = apply_trapezoid_mask(frame2, mask2)
 
-        out2 = roi2.copy()
-        # Cap valid detections to show based on initial annotation count
-        valid_tracks2 = [t for t in tracks2 if t['updated']]
-        
-        # Check FOV for deduced tracks in View 2
-        valid_tracks2_filtered = []
-        for t in valid_tracks2:
-            if t.get('was_deduced'):
-                x1, y1, x2, y2 = t['bbox']
-                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-                if not (0 <= cx < size[0] and 0 <= cy < size[1]):
-                    continue # Out of FOV
-            valid_tracks2_filtered.append(t)
-            
-        valid_tracks2_filtered.sort(key=lambda x: x.get('score', 0), reverse=True)
-        valid_tracks2_filtered = valid_tracks2_filtered[:max_tracks_view2]
-        
-        for t in valid_tracks2_filtered:
-            x1, y1, x2, y2 = map(int, t['bbox'])
-            gid = t['global_id']
-            col = (gid * 37 % 255, gid * 17 % 255, gid * 97 % 255)
-            
-            thickness = 1 if t.get('was_deduced') else 2
-            cv.rectangle(out2, (x1, y1), (x2, y2), col, thickness)
-            
-            if t.get('keypoints') is not None:
-                kpts = t['keypoints'].astype(int)  # Convert once for all operations
-                for a, b in connections:
-                    p1, p2 = kpts[a], kpts[b]
-                    if p1[0] > 0 and p2[0] > 0:
-                        cv.line(out2, tuple(p1), tuple(p2), col, thickness)
-                for p in kpts:
-                    if p[0] > 0:
-                        cv.circle(out2, tuple(p), 3, col, -1)
-                        cv.circle(out2, tuple(p), 3, (255, 255, 255), 1)
-                head = kpts[0]
-                label = f'GID:{gid}' + (' (D)' if t.get('was_deduced') else '')
-                cv.putText(out2, label, (head[0], head[1] - 10), cv.FONT_HERSHEY_SIMPLEX, 0.6, col, 2)
+        out1 = draw_tracks(roi1.copy(), tracks1, size, max_total_players, connections, tracker1, 
+                           other_tracks=tracks2, other_view_name="V2")
+        out2 = draw_tracks(roi2.copy(), tracks2, size, max_total_players, connections, tracker2, 
+                           other_tracks=tracks1, other_view_name="V1")
 
         dt = time.time() - start_time
         fps_hist.append(1 / dt if dt > 0 else 0)
