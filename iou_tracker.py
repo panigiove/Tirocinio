@@ -1,7 +1,7 @@
-# iou_tracker.py
 # Hungarian-based multi-cue tracker (IoU + appearance + pose)
 
 import numpy as np
+import cv2
 from scipy.optimize import linear_sum_assignment
 
 
@@ -19,6 +19,16 @@ def iou(b1, b2):
     return inter / denom if denom > 0 else 0.0
 
 
+class GlobalIDManager:
+    def __init__(self):
+        self._next_id = 0
+
+    def next_id(self):
+        id_to_return = self._next_id
+        self._next_id += 1
+        return id_to_return
+
+
 class IOUTracker:
     def __init__(self,
                  match_threshold=0.35,
@@ -27,14 +37,35 @@ class IOUTracker:
                  iou_weight=0.5,
                  appearance_weight=0.35,
                  pose_weight=0.15,
-                 ema_alpha=0.9):
+                 world_dist_weight=0.7, # Increased weight for spatial distance
+                 ema_alpha=0.9,
+                 camera_params=None,
+                 max_tracks=None,
+                 global_id_manager=None): # new: shared ID manager
         self.match_threshold = match_threshold
         self.cross_view_match_threshold = cross_view_match_threshold # new
         self.max_missed = max_missed_frames
         self.iou_w = iou_weight
         self.app_w = appearance_weight
         self.pose_w = pose_weight
+        self.world_w = world_dist_weight
         self.ema_alpha = ema_alpha
+        self.max_tracks = max_tracks # new
+        self.id_manager = global_id_manager if global_id_manager else GlobalIDManager()
+        
+        # Camera parameters for spatial projection
+        self.camera_params = camera_params
+        if camera_params:
+            self.mtx = np.array(camera_params['mtx'], dtype=np.float32)
+            self.dist = np.array(camera_params['dist'], dtype=np.float32)
+            self.rvec = np.array(camera_params['rvecs'], dtype=np.float32)
+            self.tvec = np.array(camera_params['tvecs'], dtype=np.float32)
+            
+            # Compute homography to ground plane (Z=0)
+            R, _ = cv2.Rodrigues(self.rvec)
+            # P = K * [R1 R2 t] (since Z=0, R3 is not needed)
+            H = self.mtx @ np.hstack([R[:, 0:2], self.tvec])
+            self.H_inv = np.linalg.inv(H)
 
         self.tracks = []
         self.next_id = 0
@@ -51,7 +82,68 @@ class IOUTracker:
         }
         self.track_to_global_id = {} # maps local track_id to a global_id
         self.global_id_to_track = {} # maps global_id to actual track objects
-        self.next_global_id = 0
+
+    def project_to_world(self, bbox):
+        """Project the bottom center of the bounding box to the ground plane (Z=0)."""
+        if not hasattr(self, 'H_inv'):
+            return None
+        
+        x1, y1, x2, y2 = bbox
+        # Use the bottom center of the bounding box as the feet position
+        pixel_point = np.array([(x1 + x2) / 2.0, y2, 1.0], dtype=np.float32).reshape(3, 1)
+        
+        world_point = self.H_inv @ pixel_point
+        world_point /= world_point[2] # Normalize
+        
+        return world_point[:2].flatten() # Return (X, Y)
+
+    def project_to_pixel(self, world_pos):
+        """Project world point (X, Y) back to pixel coordinates (x, y)."""
+        if not hasattr(self, 'mtx') or self.mtx is None:
+            return None
+        
+        # Assume Z=0 for ground plane
+        pts_3d = np.array([[world_pos[0], world_pos[1], 0.0]], dtype=np.float32)
+        img_pts, _ = cv2.projectPoints(pts_3d, self.rvec, self.tvec, self.mtx, self.dist)
+        return img_pts[0][0] # Returns [x, y]
+
+    def deduce_track_position(self, global_id, world_pos, frame_id):
+        """
+        Deduce the position of a missed track using world coordinates from another view.
+        """
+        if global_id not in self.global_id_to_track:
+            return False
+        
+        track = self.global_id_to_track[global_id]
+        if track['updated']:
+            return False # Already updated in this view
+            
+        pixel_pos = self.project_to_pixel(world_pos)
+        if pixel_pos is None:
+            return False
+            
+        # Check if projected position is within reasonably "visible" range
+        # (even if View 1 doesn't cover all, we might want to keep the virtual bbox)
+        px, py = map(int, pixel_pos)
+        
+        # Maintain current bbox size but move center to projected point
+        x1, y1, x2, y2 = track['bbox']
+        w, h = x2 - x1, y2 - y1
+        new_bbox = (px - w//2, py - h, px + w//2, py) # Bottom center at px, py
+        
+        track['bbox'] = new_bbox
+        track['world_pos'] = world_pos
+        track['updated'] = True # Mark as updated (deduced)
+        track['missed'] = 0
+        track['was_deduced'] = True
+        
+        self.current_frame_events.append({
+            'frame': frame_id, 
+            'track_id': track['track_id'], 
+            'event': 'deduced_from_other_view', 
+            'global_id': global_id
+        })
+        return True
 
     def _appearance_sim(self, a, b):
         if a is None or b is None:
@@ -77,32 +169,67 @@ class IOUTracker:
                 iou_score = iou(t['bbox'], d['bbox'])
                 app_score = self._appearance_sim(t.get('appearance'), d.get('appearance'))
                 pose_score = self._pose_sim(t.get('pose_vec'), d.get('pose_vec'))
+                spatial_sim = self._world_pos_sim(t.get('world_pos'), d.get('world_pos'))
 
-                sim = (self.iou_w * iou_score +
-                       self.app_w * app_score +
-                       self.pose_w * pose_score)
+                if t.get('world_pos') is not None and d.get('world_pos') is not None:
+                    # Spatial information is pivotal
+                    w_spatial = self.world_w
+                    w_other = (1.0 - w_spatial)
+                    # Use spatial similarity as primary, others as tie-breakers
+                    sim = (w_spatial * spatial_sim + 
+                           w_other * (0.4 * iou_score + 
+                                      0.4 * app_score + 
+                                      0.2 * pose_score))
+                else:
+                    # Fallback to standard cues if spatial is missing
+                    norm = self.iou_w + self.app_w + self.pose_w
+                    sim = (self.iou_w / norm * iou_score + 
+                           self.app_w / norm * app_score + 
+                           self.pose_w / norm * pose_score)
+                
+                # Give a boost to tracks that were missed to encourage re-identification (Re-ID)
+                if t['missed'] > 0:
+                    sim += 0.15 # Increased boost for Re-ID
+                
                 cost[i, j] = 1.0 - sim
         return cost
 
+    def _world_pos_sim(self, wp1, wp2):
+        if wp1 is None or wp2 is None:
+            return 0.0
+        # Euclidean distance in world units (e.g. millimeters or meters depending on calib)
+        dist = np.linalg.norm(wp1 - wp2)
+        # Convert distance to similarity using exponential decay
+        # Sigma should be tuned based on units and expected accuracy (e.g. 500-1000mm)
+        sigma = 1000.0 
+        return float(np.exp(-dist / sigma))
+
     # new: method to compute cross-view similarity
     def _cross_view_similarity(self, track_a, track_b):
-        # combine appearance and pose similarities,
-        # assuming no direct IoU for cross-view unless projected
+        # combine appearance, pose, and spatial similarities
         app_sim = self._appearance_sim(track_a.get('appearance'), track_b.get('appearance'))
         pose_sim = self._pose_sim(track_a.get('pose_vec'), track_b.get('pose_vec'))
+        
+        # Spatial similarity if both have world positions
+        spatial_sim = self._world_pos_sim(track_a.get('world_pos'), track_b.get('world_pos'))
 
-        # you might want to adjust weights for cross-view if they differ from single-view
-        # for example, appearance might be more reliable than pose across views due to perspective changes
-        # this is a starting point, tuning these weights will be crucial
-        cross_sim = (0.6 * app_sim + 0.4 * pose_sim) # example weights
+        if track_a.get('world_pos') is not None and track_b.get('world_pos') is not None:
+            # Adjust weights: spatial position is highly reliable
+            w_spatial = self.world_w
+            w_other = (1.0 - w_spatial) / 2.0
+            cross_sim = (w_other * app_sim + w_other * pose_sim + w_spatial * spatial_sim)
+        else:
+            cross_sim = (0.6 * app_sim + 0.4 * pose_sim)
 
         return cross_sim
     
     def _start_track(self, det, frame_id, global_id=None):
-        if global_id is None:
-            global_id = self.next_global_id
-            self.next_global_id += 1
+        if self.max_tracks is not None and len(self.tracks) >= self.max_tracks:
+            return None # do not start new track if cap reached
 
+        if global_id is None:
+            global_id = self.id_manager.next_id()
+            
         new_track = {
             'track_id': self.next_id,
             'global_id': global_id, # associate with a global ID
@@ -110,6 +237,7 @@ class IOUTracker:
             'appearance': det.get('appearance'),
             'pose_vec': det.get('pose_vec'),
             'keypoints': det.get('keypoints'),
+            'world_pos': det.get('world_pos'),
             'missed': 0,
             'updated': True,
             'was_refound_in_this_frame': False # new: initial state
@@ -134,6 +262,7 @@ class IOUTracker:
         track['bbox'] = det['bbox']
         track['keypoints'] = det.get('keypoints')
         track['pose_vec'] = det.get('pose_vec')
+        track['world_pos'] = det.get('world_pos')
 
         # EMA update for appearance
         if track.get('appearance') is not None and det.get('appearance') is not None:
@@ -178,7 +307,7 @@ class IOUTracker:
         }
 
     # Main update logic
-    def update(self, detections, frame_id): # new: accept frame_id
+    def update(self, detections, frame_id, finalize=True): # new: finalize parameter
         self.current_frame_events = [] # clear events for the new frame
         self.current_frame_statistics = { # reset per-frame statistics
             'added_tracks': 0,
@@ -191,14 +320,7 @@ class IOUTracker:
         for t in self.tracks:
             t['updated'] = False
             t['was_refound_in_this_frame'] = False # new: track if refound in this frame
-
-        if len(self.tracks) == 0:
-            for d in detections:
-                self._start_track(d, frame_id)
-            self._prune(frame_id) # ensure pruning happens even for first frame
-            self.current_frame_statistics['active_tracks'] = len(self.tracks)
-            self.total_active_tracks = len(self.tracks)
-            return self.tracks, [], detections # Return tracks, matched_global_ids, unmatched_detections
+            t['was_deduced'] = False # reset deduction flag
 
         if len(detections) == 0:
             for t in self.tracks:
@@ -243,6 +365,11 @@ class IOUTracker:
             if j not in matched_dets_indices:
                 unmatched_detections.append(d)
 
+        if finalize:
+            for d in unmatched_detections:
+                self._start_track(d, frame_id)
+            unmatched_detections = [] # clear them since they are now tracks
+
         self._prune(frame_id)
         
         self.current_frame_statistics['active_tracks'] = len(self.tracks)
@@ -278,20 +405,21 @@ class IOUTracker:
                 
                 # Assign the global_id from the other track to the new track created from current_det
                 new_track_obj = self._start_track(current_det, frame_id, global_id=other_track['global_id'])
-                cross_view_matches.append({
-                    'current_view_track_id': new_track_obj['track_id'],
-                    'other_view_track_id': other_track['track_id'],
-                    'global_id': other_track['global_id']
-                })
-                matched_other_view_tracks_indices.add(r)
-                matched_current_dets_indices.add(c)
-                self.current_frame_events.append({
-                    'frame': frame_id,
-                    'track_id': new_track_obj['track_id'],
-                    'event': 'cross_view_match_found',
-                    'global_id': new_track_obj['global_id'],
-                    'matched_with_other_view_track_id': other_track['track_id']
-                })
+                if new_track_obj:
+                    cross_view_matches.append({
+                        'current_view_track_id': new_track_obj['track_id'],
+                        'other_view_track_id': other_track['track_id'],
+                        'global_id': other_track['global_id']
+                    })
+                    matched_other_view_tracks_indices.add(r)
+                    matched_current_dets_indices.add(c)
+                    self.current_frame_events.append({
+                        'frame': frame_id,
+                        'track_id': new_track_obj['track_id'],
+                        'event': 'cross_view_match_found',
+                        'global_id': new_track_obj['global_id'],
+                        'matched_with_other_view_track_id': other_track['track_id']
+                    })
 
         # detections that were unmatched even after cross-view matching will start new tracks
         remaining_unmatched_detections = []

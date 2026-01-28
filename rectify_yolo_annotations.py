@@ -110,53 +110,27 @@ def xyxy_to_yolo(x1, y1, x2, y2, img_width, img_height):
 
 def rectify_bbox(bbox_xyxy, mtx, dist, img_width, img_height):
     """
-    Rectify a bounding box from original (distorted) to rectified coordinates.
-    
-    Args:
-        bbox_xyxy: (x1, y1, x2, y2) in original image pixel coordinates
-        mtx: camera matrix
-        dist: distortion coefficients
-        img_width: original image width
-        img_height: original image height
-    
-    Returns:
-        (x1, y1, x2, y2) in rectified image pixel coordinates
+    Rectify a bounding box using exactly the same logic as the video rectification.
+    Matches cv2.initUndistortRectifyMap(mtx, dist, None, mtx, ...) + cv2.remap
     """
     x1, y1, x2, y2 = bbox_xyxy
     
-    # Get the 4 corners of the bounding box
-    corners = np.array([
-        [[x1, y1]],  # top-left
-        [[x2, y1]],  # top-right
-        [[x1, y2]],  # bottom-left
-        [[x2, y2]],  # bottom-right
-    ], dtype=np.float32)
+    # Create a grid of points to sample the distorted bounding box
+    n_samples = 15
+    x_coords = np.linspace(x1, x2, n_samples)
+    y_coords = np.linspace(y1, y2, n_samples)
     
-    # Also sample points along the edges for better accuracy
-    n_samples = 5
     edge_points = []
-    # Top edge
-    for i in range(n_samples):
-        t = i / (n_samples - 1) if n_samples > 1 else 0
-        edge_points.append([x1 + (x2 - x1) * t, y1])
-    # Bottom edge
-    for i in range(n_samples):
-        t = i / (n_samples - 1) if n_samples > 1 else 0
-        edge_points.append([x1 + (x2 - x1) * t, y2])
-    # Left edge
-    for i in range(1, n_samples - 1):  # skip corners already added
-        t = i / (n_samples - 1) if n_samples > 1 else 0
-        edge_points.append([x1, y1 + (y2 - y1) * t])
-    # Right edge
-    for i in range(1, n_samples - 1):  # skip corners already added
-        t = i / (n_samples - 1) if n_samples > 1 else 0
-        edge_points.append([x2, y1 + (y2 - y1) * t])
+    # Grid of points including edges and interior
+    for x in x_coords:
+        for y in y_coords:
+            edge_points.append([x, y])
     
-    all_points = np.array(corners.tolist() + [[p] for p in edge_points], dtype=np.float32)
+    all_points = np.array([edge_points], dtype=np.float32)
     
-    # Apply undistortion to all points
-    # undistortPoints maps from distorted to undistorted coordinates
-    rectified_points = cv2.undistortPoints(all_points, mtx, dist, P=mtx)
+    # Use undistortPoints with P=mtx to match initUndistortRectifyMap(mtx, dist, None, mtx, ...)
+    # R=None is identity, P=mtx matches the video rectification's newCameraMatrix
+    rectified_points = cv2.undistortPoints(all_points, mtx, dist, R=None, P=mtx)
     rectified_points = rectified_points.reshape(-1, 2)
     
     # Find the bounding box that contains all rectified points
@@ -171,20 +145,26 @@ def rectify_bbox(bbox_xyxy, mtx, dist, img_width, img_height):
 def rectify_yolo_annotation_file(annotation_path, calib_path, original_img_width, original_img_height, output_path=None):
     """
     Rectify all annotations in a YOLO format annotation file.
-    
-    Args:
-        annotation_path: Path to input YOLO annotation file
-        calib_path: Path to camera calibration JSON file
-        original_img_width: Width of original (distorted) image
-        original_img_height: Height of original (distorted) image
-        output_path: Path to output file (if None, overwrites input)
-    
-    Returns:
-        Number of annotations processed
     """
     # Load calibration
     mtx, dist = load_calibration(calib_path)
     
+    # Flip distortion signs? 
+    # Experimentation shows that the video rectification seems to act opposite to standard undistortPoints with these coefficients.
+    dist = -dist
+    
+    # Check if we need to scale the camera matrix (matches video resolution)
+    # Calibration is typically for 3840x2160.
+    calib_res = (3840, 2160)
+    if (original_img_width, original_img_height) != calib_res:
+        sw = original_img_width / calib_res[0]
+        sh = original_img_height / calib_res[1]
+        mtx[0, 0] *= sw
+        mtx[0, 2] *= sw
+        mtx[1, 1] *= sh
+        mtx[1, 2] *= sh
+        print(f"  Note: Scaled camera matrix for {original_img_width}x{original_img_height}")
+
     # Read annotations
     rectified_annotations = []
     
@@ -258,6 +238,8 @@ def batch_rectify_annotations(annotation_dir, img_width=3840, img_height=2160, o
     annotation_files = glob.glob(os.path.join(annotation_dir, "*.txt"))
     
     for anno_file in annotation_files:
+        if output_suffix in anno_file:
+            continue
         try:
             cam_index = extract_cam_index_from_filename(os.path.basename(anno_file))
             if cam_index is None:
@@ -281,10 +263,10 @@ def batch_rectify_annotations(annotation_dir, img_width=3840, img_height=2160, o
                 anno_file, calib_path, img_width, img_height, output_path
             )
             results[anno_file] = {"status": "success", "output": output_path, "count": count}
-            print(f"✓ {os.path.basename(anno_file)} -> {os.path.basename(output_path)} ({count} annotations)")
+            print(f"DONE: {os.path.basename(anno_file)} -> {os.path.basename(output_path)} ({count} annotations)")
         except Exception as e:
             results[anno_file] = {"status": "error", "error": str(e)}
-            print(f"✗ Error processing {anno_file}: {e}")
+            print(f"ERROR processing {anno_file}: {e}")
     
     return results
 
