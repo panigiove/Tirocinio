@@ -5,12 +5,13 @@ import cv2 as cv
 import numpy as np
 
 
-def compute_team_appearence(frame, bbox, h_bins=32, s_bins=12, upper_fraction=0.6):
+def compute_team_appearence(frame, bbox, h_bins=16, s_bins=8, upper_fraction=0.6, num_strips=3):
     """
     Extract an appearance descriptor robust to team sports:
-    - HSV histogram (H,S) from upper body (jersey area)
-    - Mean LAB color
-    - L2-normalized descriptor
+    - Divide the upper body (jersey area) into horizontal strips
+    - HSV histogram (H,S) for each strip
+    - Mean LAB color for each strip
+    - L2-normalized concatenated descriptor
     """
     if bbox is None:
         return None
@@ -28,17 +29,35 @@ def compute_team_appearence(frame, bbox, h_bins=32, s_bins=12, upper_fraction=0.
     if crop.size == 0:
         return None
 
-    # HSV histogram (jersey color)
-    hsv = cv.cvtColor(crop, cv.COLOR_BGR2HSV)
-    hist = cv.calcHist([hsv], [0, 1], None, [h_bins, s_bins], [0, 180, 0, 256])
-    cv.normalize(hist, hist)
-    hist = hist.flatten().astype(np.float32)
+    strip_h = top_h // num_strips
+    if strip_h == 0:
+        strip_h = top_h
+        num_strips = 1
 
-    # LAB mean color (illumination-robust)
-    lab = cv.cvtColor(crop, cv.COLOR_BGR2LAB)
-    mean_lab = np.array(cv.mean(lab)[:3], dtype=np.float32) / 255.0
+    descriptors = []
+    for i in range(num_strips):
+        y_start = i * strip_h
+        y_end = (i + 1) * strip_h if i < num_strips - 1 else top_h
+        strip_crop = crop[y_start:y_end, :]
+        
+        if strip_crop.size == 0:
+            # Padding for empty strips
+            descriptors.append(np.zeros(h_bins * s_bins + 3, dtype=np.float32))
+            continue
 
-    desc = np.concatenate([hist, mean_lab])
+        # HSV histogram (jersey color)
+        hsv = cv.cvtColor(strip_crop, cv.COLOR_BGR2HSV)
+        hist = cv.calcHist([hsv], [0, 1], None, [h_bins, s_bins], [0, 180, 0, 256])
+        cv.normalize(hist, hist)
+        hist_flat = hist.flatten().astype(np.float32)
+
+        # LAB mean color (illumination-robust)
+        lab = cv.cvtColor(strip_crop, cv.COLOR_BGR2LAB)
+        mean_lab = np.array(cv.mean(lab)[:3], dtype=np.float32) / 255.0
+
+        descriptors.append(np.concatenate([hist_flat, mean_lab]))
+
+    desc = np.concatenate(descriptors)
     norm = np.linalg.norm(desc)
     if norm > 0:
         desc /= norm

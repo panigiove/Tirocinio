@@ -41,7 +41,7 @@ class IOUTracker:
     """
     def __init__(self,
                  match_threshold=0.35,
-                 cross_view_match_threshold=0.5,
+                 cross_view_match_threshold=0.4,
                  max_missed_frames=10,
                  iou_weight=0.5,
                  appearance_weight=0.35,
@@ -164,25 +164,49 @@ class IOUTracker:
         p3d = p4d[:3] / p4d[3]
         return p3d.flatten()
 
-    def deduce_track_position(self, global_id, world_pos, frame_id):
+    def deduce_track_position(self, global_id, world_pos, frame_id, frame_shape=None, mask=None):
         """
         Deduce the position of a missed track using world coordinates from another view.
         """
+        pixel_pos = self.project_to_pixel(world_pos)
+        if pixel_pos is None:
+            return False
+            
+        px, py = map(int, pixel_pos)
+
+        # Check if projected point is within frame bounds
+        if frame_shape is not None:
+            h, w = frame_shape[:2]
+            if not (0 <= px < w and 0 <= py < h):
+                return False
+
+        # Check if within mask (ROI)
+        if mask is not None:
+            if py < 0 or py >= mask.shape[0] or px < 0 or px >= mask.shape[1] or mask[py, px] == 0:
+                return False
+
         if global_id not in self.global_id_to_track:
+            # If the track doesn't exist in this view, start it
+            # Use default dimensions since we don't have a local history
+            tw, th = 40, 80
+            new_bbox = (px - tw//2, py - th, px + tw//2, py)
+            det_placeholder = {
+                'bbox': new_bbox,
+                'world_pos': world_pos,
+                'appearance': None,
+                'pose_vec': None,
+                'keypoints': None
+            }
+            track = self._start_track(det_placeholder, frame_id, global_id=global_id)
+            if track:
+                track['was_deduced'] = True
+                return True
             return False
         
         track = self.global_id_to_track[global_id]
         if track['updated']:
             return False # Already updated in this view
             
-        pixel_pos = self.project_to_pixel(world_pos)
-        if pixel_pos is None:
-            return False
-            
-        # Check if projected position is within reasonably "visible" range
-        # (even if View 1 doesn't cover all, we might want to keep the virtual bbox)
-        px, py = map(int, pixel_pos)
-        
         # Maintain current bbox size but move center to projected point
         x1, y1, x2, y2 = track['bbox']
         w, h = x2 - x1, y2 - y1
@@ -193,6 +217,8 @@ class IOUTracker:
         track['updated'] = True # Mark as updated (deduced)
         track['missed'] = 0
         track['was_deduced'] = True
+        track['keypoints'] = None  # Clear old keypoints for deduced tracks
+        track['pose_vec'] = None   # Clear old pose vector
         
         self.current_frame_events.append({
             'frame': frame_id, 
@@ -246,17 +272,28 @@ class IOUTracker:
                         spatial_sim = self._world_pos_sim(t['world_pos'], d['world_pos'], dist=dist)
 
                 if t.get('world_pos') is not None and d.get('world_pos') is not None:
+                    # Use provided weights for non-spatial cues, normalized to sum to 1.0
+                    w_norm = self.iou_w + self.app_w + self.pose_w
+                    if w_norm == 0:
+                        non_spatial_sim = 0
+                    else:
+                        non_spatial_sim = (self.iou_w / w_norm * iou_score + 
+                                          self.app_w / w_norm * app_score + 
+                                          self.pose_w / w_norm * pose_score)
+
                     if not physically_possible:
-                        # Impossible jump: enforce maximum cost
-                        sim = 0.0
+                        # Impossible jump: heavily penalize but don't zero out completely
+                        # if other cues are extremely strong (e.g. initial frame matching)
+                        spatial_sim = 0.0
+                        w_spatial = self.world_w
+                        w_other = (1.0 - w_spatial)
+                        sim = w_other * non_spatial_sim * 0.75 # Less severe penalty (25% off)
                     else:
                         # Spatial information is pivotal
                         w_spatial = self.world_w
                         w_other = (1.0 - w_spatial)
                         sim = (w_spatial * spatial_sim + 
-                               w_other * (0.4 * iou_score + 
-                                          0.4 * app_score + 
-                                          0.2 * pose_score))
+                               w_other * non_spatial_sim)
                 else:
                     # Fallback to standard cues if spatial is missing
                     norm = self.iou_w + self.app_w + self.pose_w
@@ -296,8 +333,8 @@ class IOUTracker:
             dist = np.linalg.norm(wp1[:2] - wp2[:2])
         # Convert distance to similarity using exponential decay
         # Sigma should be tuned based on units and expected accuracy (e.g. 500-1000mm)
-        # Increased to 1500 to make cross-view tracking more robust to calibration inaccuracies.
-        sigma = 1500.0 
+        # Increased to 2500 to make cross-view tracking even more robust to calibration inaccuracies.
+        sigma = 2500.0 
         return float(np.exp(-dist / sigma))
 
     def _cross_view_similarity(self, track_a, track_b):
@@ -319,45 +356,86 @@ class IOUTracker:
         # Spatial similarity if both have world positions
         spatial_sim = self._world_pos_sim(track_a.get('world_pos'), track_b.get('world_pos'))
 
+        # Non-spatial weights for cross-view (IoU not available)
+        w_app_pose_norm = self.app_w + self.pose_w
+        if w_app_pose_norm == 0:
+            w_app_rel = 0.5
+            w_pose_rel = 0.5
+        else:
+            w_app_rel = self.app_w / w_app_pose_norm
+            w_pose_rel = self.pose_w / w_app_pose_norm
+
         if track_a.get('world_pos') is not None and track_b.get('world_pos') is not None:
             # Adjust weights: spatial position is highly reliable
-            # We use a slightly higher weight for appearance in cross-view to aid spatial matching
             w_spatial = self.world_w
-            w_app = (1.0 - w_spatial) * 0.7
-            w_pose = (1.0 - w_spatial) * 0.3
-            cross_sim = (w_app * app_sim + w_pose * pose_sim + w_spatial * spatial_sim)
+            w_other = (1.0 - w_spatial)
+            cross_sim = (w_other * (w_app_rel * app_sim + w_pose_rel * pose_sim) + 
+                         w_spatial * spatial_sim)
         else:
-            cross_sim = (0.7 * app_sim + 0.3 * pose_sim)
+            cross_sim = (w_app_rel * app_sim + w_pose_rel * pose_sim)
 
         return cross_sim
     
     def _start_track(self, det, frame_id, global_id=None):
         """
-        Starts a new track or reactivates an existing one if global_id is provided.
+        Starts a new track or reactivates an existing one.
         """
-        # Count currently updated tracks in this frame
-        active_in_frame = len([t for t in self.tracks if t['updated']])
-        
-        if self.max_tracks is not None and active_in_frame >= self.max_tracks:
-            # If we already have enough tracks in this frame, only allow if it's a known global_id
-            if global_id is None:
-                return None 
-
-        if global_id is None:
-            # If we are already tracking the maximum possible players globally, don't start a new one
-            if self.max_tracks is not None and len(self.global_id_to_track) >= self.max_tracks:
-                return None
-            global_id = self.id_manager.next_id()
-        else:
-            # Sync the ID manager
-            self.id_manager.update_max_id(global_id)
-            
-            # CRITICAL FIX: If a track with this global_id already exists, reuse it!
+        # 1. If global_id is provided, try to find that specific track first
+        if global_id is not None:
             if global_id in self.global_id_to_track:
                 existing_track = self.global_id_to_track[global_id]
+                # If it's already updated, we can't update it again with a different detection
+                # (unless we implement multi-detection handling, but for now return None)
+                if existing_track['updated']:
+                    return None
                 self._update_track(existing_track, det, frame_id)
-                existing_track['updated'] = True # Force updated flag
+                existing_track['updated'] = True
                 return existing_track
+            else:
+                # Sync ID manager if it's a new ID coming from outside
+                self.id_manager.update_max_id(global_id)
+        
+        # 2. If no global_id provided, or provided ID doesn't exist yet,
+        # try to Re-ID into any MISSED track based on appearance/pose
+        best_sim = -1
+        best_t = None
+        missed_tracks = [t for t in self.tracks if not t['updated']]
+        
+        for t in missed_tracks:
+            app_sim = self._appearance_sim(t.get('appearance'), det.get('appearance'))
+            pose_sim = self._pose_sim(t.get('pose_vec'), det.get('pose_vec'))
+            
+            # Weighted combination for Re-ID (using app/pose weights)
+            w_norm = self.app_w + self.pose_w
+            if w_norm > 0:
+                sim = (self.app_w / w_norm * app_sim + self.pose_w / w_norm * pose_sim)
+            else:
+                sim = 0.5 * app_sim + 0.5 * pose_sim
+            
+            if sim > best_sim:
+                best_sim = sim
+                best_t = t
+        
+        # Threshold for Re-ID (tuned to be slightly conservative but allow recovery)
+        if best_t is not None and best_sim > 0.4:
+            self._update_track(best_t, det, frame_id)
+            best_t['updated'] = True
+            return best_t
+
+        # 3. If we can't Re-ID, only start a new track if we are under the limit
+        active_in_frame = len([t for t in self.tracks if t['updated']])
+        if self.max_tracks is not None:
+            # If we already have N players active, don't start a new one
+            if active_in_frame >= self.max_tracks:
+                return None
+            # If we have N players total in the system, don't start a new ID
+            if global_id is None and len(self.global_id_to_track) >= self.max_tracks:
+                return None
+
+        if global_id is None:
+            return None  # Don't start new tracks without global_id
+
+        global_id = self.id_manager.next_id()
             
         new_track = {
             'track_id': self.next_id,
@@ -367,6 +445,7 @@ class IOUTracker:
             'pose_vec': det.get('pose_vec'),
             'keypoints': det.get('keypoints'),
             'world_pos': det.get('world_pos'),
+            'start_frame': frame_id, # Track when the track started
             'missed': 0,
             'updated': True,
             'was_refound_in_this_frame': False,
@@ -379,6 +458,33 @@ class IOUTracker:
         self.current_frame_statistics['added_tracks'] += 1
         self.next_id += 1
         return new_track
+
+
+    def merge_global_ids(self, old_gid, new_gid, frame_id):
+        """
+        Merges two global IDs. All references to old_gid will be updated to new_gid.
+        """
+        if old_gid == new_gid:
+            return
+        
+        if old_gid in self.global_id_to_track:
+            track = self.global_id_to_track[old_gid]
+            # Remove old mapping
+            del self.global_id_to_track[old_gid]
+            # Update track object
+            track['global_id'] = new_gid
+            # Add new mapping
+            self.global_id_to_track[new_gid] = track
+            # Update track_to_global_id mapping
+            self.track_to_global_id[track['track_id']] = new_gid
+            
+            self.current_frame_events.append({
+                'frame': frame_id,
+                'track_id': track['track_id'],
+                'event': 'merged_id',
+                'old_global_id': old_gid,
+                'new_global_id': new_gid
+            })
 
 
     def _update_track(self, track, det, frame_id): # new: accept frame_id
@@ -396,10 +502,15 @@ class IOUTracker:
 
         # EMA update for appearance
         if track.get('appearance') is not None and det.get('appearance') is not None:
-            track['appearance'] = (
+            updated_app = (
                 self.ema_alpha * track['appearance'] +
                 (1.0 - self.ema_alpha) * det['appearance']
             )
+            # Re-normalize to maintain unit vector for cosine similarity
+            norm = np.linalg.norm(updated_app)
+            if norm > 0:
+                updated_app /= norm
+            track['appearance'] = updated_app
         else:
             track['appearance'] = det.get('appearance')
 

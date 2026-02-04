@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 13
+names: ['Ball', 'Red_11', 'Red_12', 'Red_2', 'Red_23', 'Red_4', 'Refree_F', 'Refree_M', 'White_13', 'White_16', 'White_25', 'White_27', 'White_34']
+
+roboflow:
+  workspace: tracking-rybv7
+  project: tracking_12
+  version: 4
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/tracking-rybv7/tracking_12/dataset/4

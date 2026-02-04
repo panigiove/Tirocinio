@@ -18,8 +18,8 @@ import glob
 # ================= CONFIGURATION =================
 # Single file mode: Set annotation_file to process one file
 # Batch mode: Set annotation_dir to process all .txt files in a directory
-ANNOTATION_FILE = None  # e.g., 'tracking_12.v2i.yolov11/train/labels/out4_frame_0001_png.rf.13ad8a164866d2d0e8151ff7a71f7908.txt'
-ANNOTATION_DIR = 'tracking_12.v2i.yolov11/train/labels/'
+ANNOTATION_FILE = None  # e.g., 'tracking_12.v4i.yolov11/train/labels/out4_frame_0001_png.rf.13ad8a164866d2d0e8151ff7a71f7908.txt'
+ANNOTATION_DIR = 'tracking_12.v4i.yolov11/train/labels/'
 
 # Image dimensions (original/distorted image size)
 IMG_WIDTH = 3840
