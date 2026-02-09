@@ -17,25 +17,19 @@ from appearence_utils import compute_team_appearence, keypoints_to_pose_vec
 
 # ================= ROI / MASK =================
 # Mask for View 1
-TRAPEZ_TOP_LEFT_1 = (0, 0)
-TRAPEZ_TOP_RIGHT_1 = (1440, 0)
-TRAPEZ_BOTTOM_LEFT_1 = (0, 810)
-TRAPEZ_BOTTOM_RIGHT_1 = (1440, 810)
-CURVE_HEIGHT_1 = 0
+TRAPEZ_TOP_LEFT_1 = (200, 340)
+TRAPEZ_TOP_RIGHT_1 = (1240, 340)
+TRAPEZ_BOTTOM_LEFT_1 = (0, 665)
+TRAPEZ_BOTTOM_RIGHT_1 = (1440, 635)
+CURVE_HEIGHT_1 = 70
 
 # Mask for View 2
-TRAPEZ_TOP_LEFT_2 = (200, 330)
-TRAPEZ_TOP_RIGHT_2 = (1240, 330)
-TRAPEZ_BOTTOM_LEFT_2 = (0, 665)
-TRAPEZ_BOTTOM_RIGHT_2 = (1440, 665)
-CURVE_HEIGHT_2 = 65
+TRAPEZ_TOP_LEFT_2 = (0, 0)
+TRAPEZ_TOP_RIGHT_2 = (1440, 0)
+TRAPEZ_BOTTOM_LEFT_2 = (0, 810)
+TRAPEZ_BOTTOM_RIGHT_2 = (1440, 810)
+CURVE_HEIGHT_2 = 0
 
-# Mask for View 3 (assuming similar to view 2 for now)
-TRAPEZ_TOP_LEFT_3 = (0, 0)
-TRAPEZ_TOP_RIGHT_3 = (1440, 0)
-TRAPEZ_BOTTOM_LEFT_3 = (0, 810)
-TRAPEZ_BOTTOM_RIGHT_3 = (1440, 810)
-CURVE_HEIGHT_3 = 0
 # ================= UTILITIES =================
 
 def round_to_multiple(value, multiple):
@@ -84,7 +78,7 @@ def process_detection_pose(frame, bbox, pose_model, pose_attempts, pose_conf_thr
     
     pose_kpts, pose_vec = None, None
     
-    # Try first attempt (usually no padding, fastest)
+    # Try first attempt
     pb = pad_bbox(bbox, pose_attempts[0]['pad'], frame.shape)
     px1, py1, px2, py2 = pb
     crop = frame[py1:py2, px1:px2]
@@ -103,7 +97,7 @@ def process_detection_pose(frame, bbox, pose_model, pose_attempts, pose_conf_thr
             pose_vec = keypoints_to_pose_vec(pose_kpts, bbox)
             return pose_kpts, pose_vec
     
-    # Fallback to second attempt only if first failed
+    # Fallback to second attempt
     if len(pose_attempts) > 1:
         pb = pad_bbox(bbox, pose_attempts[1]['pad'], frame.shape)
         px1, py1, px2, py2 = pb
@@ -132,26 +126,25 @@ def draw_text_with_bg(img, text, pos, scale=0.6):
     cv.rectangle(img, (x, y - th - 10), (x + tw + 20, y + b + 10), (0, 0, 0), -1)
     cv.putText(img, text, (x + 10, y), font, scale, (255, 255, 255), 2)
 
-# new function to parse YOLO annotations
-def parse_yolo_annotations(anno_file, img_width, img_height, frame, pose_model, pose_attempts, pose_conf_threshold, pose_iou_threshold, tracker=None):
-    print(f"DEBUG: Attempting to parse {anno_file}")
+
+def parse_yolo_annotations(anno_file, img_width, img_height, frame, pose_model, pose_attempts, 
+                          pose_conf_threshold, pose_iou_threshold, tracker=None):
+    """Parse YOLO format annotations from file."""
     detections = []
     if not os.path.exists(anno_file):
-        print(f"ERROR: Annotation file does not exist: {anno_file}")
         return detections
+    
     try:
-        lines_read = 0
         with open(anno_file, 'r') as f:
             for line in f:
-                lines_read += 1
                 parts = line.strip().split(' ')
                 if len(parts) < 5:
-                    print(f"DEBUG: Skipping short line: {line.strip()}")
-                    continue  # Skip invalid lines
+                    continue
+                
                 class_id = int(parts[0])
-                # Process all annotations (class_id can be any value - player IDs, object types, etc.)
                 center_x, center_y, width, height = map(float, parts[1:])
-                # Convert normalized YOLO format to pixel coordinates (xyxy)
+                
+                # Convert normalized YOLO format to pixel coordinates
                 x1 = int((center_x - width / 2) * img_width)
                 y1 = int((center_y - height / 2) * img_height)
                 x2 = int((center_x + width / 2) * img_width)
@@ -159,13 +152,10 @@ def parse_yolo_annotations(anno_file, img_width, img_height, frame, pose_model, 
                 bbox = (x1, y1, x2, y2)
 
                 appearance = compute_team_appearence(frame, bbox)
-                pose_kpts, pose_vec = None, None
-
-                # Perform pose estimation on the annotated bounding box (optimized)
                 pose_kpts, pose_vec = process_detection_pose(
-                    frame, bbox, pose_model, pose_attempts, pose_conf_threshold, pose_iou_threshold
+                    frame, bbox, pose_model, pose_attempts, 
+                    pose_conf_threshold, pose_iou_threshold
                 )
-
                 world_pos = tracker.project_to_world(bbox) if tracker else None
 
                 detections.append({
@@ -174,26 +164,18 @@ def parse_yolo_annotations(anno_file, img_width, img_height, frame, pose_model, 
                     'keypoints': pose_kpts,
                     'pose_vec': pose_vec,
                     'world_pos': world_pos,
-                    'score': 1.0, # Assign a high score for initial annotations
-                    'global_id': class_id # Use class_id from annotation file
+                    'score': 1.0,
+                    'global_id': class_id,
+                    'gid_source': 'annotation'
                 })
-        print(f"  Parsed {lines_read} lines from annotation file, created {len(detections)} detections")
-    except FileNotFoundError:
-        print(f"warning: annotation file not found at {anno_file}. skipping initial annotations for this view.")
     except Exception as e:
-        print(f"error: failed to parse annotations from {anno_file}: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"Error parsing annotations from {anno_file}: {e}")
+    
     return detections
 
-def load_annotations_from_dir(annotations_dir, video_prefix, img_width, img_height, pose_model, pose_attempts, pose_conf_threshold, pose_iou_threshold, tracker=None):
-    """
-    Load all annotation files from a directory and organize by frame number.
-    Filters for files starting with video_prefix and ending with '_rectified.txt'
-    Assumes filenames contain 'frame_XXXX' where XXXX is the 1-based frame number.
-    Converts to 0-based frame_id.
-    Returns a dict frame_id -> list of anno_file paths
-    """
+
+def load_annotations_from_dir(annotations_dir, video_prefix):
+    """Load all annotation files from a directory."""
     annotations = {}
     if not annotations_dir or not os.path.exists(annotations_dir):
         return annotations
@@ -207,51 +189,49 @@ def load_annotations_from_dir(annotations_dir, video_prefix, img_width, img_heig
                 if frame_id not in annotations:
                     annotations[frame_id] = []
                 annotations[frame_id].append(anno_path)
-            else:
-                print(f"Warning: Could not extract frame number from {file}")
+    
     return annotations
 
-def draw_tracks(img, tracks, size, max_tracks, connections, tracker_self, other_tracks=None, other_view_name="V2"):
-    """
-    Helper function to draw tracks, keypoints and cross-view projections on a frame.
-    """
-    # Show any track that is currently tracked (within missed frame tolerance)
+
+def _min_annotated_frame(*annotations_sets):
+    frames = []
+    for ann in annotations_sets:
+        if ann:
+            frames.extend(list(ann.keys()))
+    return min(frames) if frames else None
+
+
+def draw_tracks(img, tracks, max_tracks, connections, tracker_self):
+    """Draw tracks, keypoints and cross-view projections on a frame."""
     valid_tracks = [t for t in tracks if t['missed'] <= tracker_self.max_missed]
     
-    # Filter by FOV and only active tracks
+    # Filter by active tracks only (missed == 0 and not deduced)
     valid_tracks_filtered = []
     for t in valid_tracks:
-        x1, y1, x2, y2 = t['bbox']
-        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-        
-        # Only draw tracks that are currently detected (missed == 0) and not deduced
         if t['missed'] == 0 and not t.get('was_deduced'):
             valid_tracks_filtered.append(t)
     
-    # Sort by ID to keep colors consistent
     valid_tracks_filtered.sort(key=lambda x: x['global_id'])
     
-    # Limit to max_tracks
     if max_tracks is not None:
         valid_tracks_filtered = valid_tracks_filtered[:max_tracks]
     
-    # Draw primary tracks for this view
+    # Draw tracks
     for t in valid_tracks_filtered:
         x1, y1, x2, y2 = map(int, t['bbox'])
         gid = t['global_id']
         col = (gid * 37 % 255, gid * 17 % 255, gid * 97 % 255)
         
-        # Rectangle for player
-        # Use dashed or thinner lines for deduced/missed tracks
         thickness = 1 if (t.get('was_deduced') or t['missed'] > 0) else 2
         cv.rectangle(img, (x1, y1), (x2, y2), col, thickness)
         
-        # Always display GID label at the top-center of the bbox
+        # Label
         cx = (x1 + x2) // 2
         cy = y1
         label = f'GID:{gid}' + (' (D)' if t.get('was_deduced') else '')
         cv.putText(img, label, (cx, cy - 10), cv.FONT_HERSHEY_SIMPLEX, 0.6, col, 2)
         
+        # Keypoints
         if t.get('keypoints') is not None and t['missed'] == 0:
             kpts = t['keypoints'].astype(int)
             for a, b in connections:
@@ -262,12 +242,73 @@ def draw_tracks(img, tracks, size, max_tracks, connections, tracker_self, other_
                 if p[0] > 0:
                     cv.circle(img, tuple(p), 3, col, -1)
                     cv.circle(img, tuple(p), 3, (255, 255, 255), 1)
-            head = kpts[0]
-            # Label is now displayed outside the pose check
 
     return img
 
+def _augment_event_with_world_pos(event, tracker):
+    """Attach world position (x,y,z) to an event if track has it."""
+    if tracker is None:
+        return event
+    tid = event.get('track_id')
+    if tid is None:
+        return event
+    track = next((t for t in tracker.tracks if t.get('track_id') == tid), None)
+    wp = track.get('world_pos') if track else None
+    if wp is not None and len(wp) >= 3:
+        event['world_x'] = float(wp[0])
+        event['world_y'] = float(wp[1])
+        event['world_z'] = float(wp[2])
+        event['world_pos_json'] = json.dumps([float(wp[0]), float(wp[1]), float(wp[2])])
+        event['has_world_pos'] = 1
+    else:
+        event['world_x'] = ''
+        event['world_y'] = ''
+        event['world_z'] = ''
+        event['world_pos_json'] = ''
+        event['has_world_pos'] = 0
+    return event
+
 # ================= MAIN =================
+
+def _bbox_area(b):
+    x1, y1, x2, y2 = b
+    return max(0, x2 - x1) * max(0, y2 - y1)
+
+
+def _bbox_intersection(a, b):
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    return max(0, ix2 - ix1) * max(0, iy2 - iy1)
+
+
+def _suppress_nested_detections(detections, contain_thresh=0.9, area_ratio_thresh=0.6):
+    if len(detections) < 2:
+        return detections
+    keep = [True] * len(detections)
+    areas = [_bbox_area(d['bbox']) for d in detections]
+    for i in range(len(detections)):
+        if not keep[i]:
+            continue
+        for j in range(len(detections)):
+            if i == j or not keep[j]:
+                continue
+            if areas[i] <= 0 or areas[j] <= 0:
+                continue
+            # Consider j nested in i
+            if areas[j] >= areas[i]:
+                continue
+            inter = _bbox_intersection(detections[i]['bbox'], detections[j]['bbox'])
+            contain = inter / areas[j] if areas[j] > 0 else 0.0
+            area_ratio = areas[j] / areas[i]
+            if contain >= contain_thresh and area_ratio <= area_ratio_thresh:
+                # Prefer higher score; keep annotations
+                if detections[j].get('gid_source') == 'annotation':
+                    continue
+                if detections[j].get('score', 0.0) <= detections[i].get('score', 0.0):
+                    keep[j] = False
+    return [d for d, k in zip(detections, keep) if k]
 
 def load_calibration(calib_path):
     if not calib_path or not os.path.exists(calib_path):
@@ -276,133 +317,783 @@ def load_calibration(calib_path):
         return json.load(f)
 
 
+def load_indexed_points(points_path):
+    if not points_path or not os.path.exists(points_path):
+        return {}
+    with open(points_path, 'r') as f:
+        data = json.load(f)
+    out = {}
+    for item in data.get('rectified_img_corners_indexed', []):
+        idx = item.get('index')
+        pt = item.get('point')
+        if idx is None or pt is None or len(pt) != 2:
+            continue
+        out[int(idx)] = np.array([float(pt[0]), float(pt[1])], dtype=np.float32)
+    return out
+
+
+def load_court_lines(lines_path, points_by_idx):
+    if not lines_path or not os.path.exists(lines_path):
+        return []
+    with open(lines_path, 'r') as f:
+        data = json.load(f)
+    lines = []
+    for item in data.get('rectified_court_lines', []):
+        line_id = item.get('line_id')
+        si = item.get('start_point_index')
+        ei = item.get('end_point_index')
+        if line_id is None or si is None or ei is None:
+            continue
+        p1 = points_by_idx.get(int(si))
+        p2 = points_by_idx.get(int(ei))
+        if p1 is None or p2 is None:
+            continue
+        lines.append({
+            'line_id': int(line_id),
+            'p1': p1.copy(),
+            'p2': p2.copy()
+        })
+    return lines
+
+
+def load_line_correspondences(path, view1_key, view2_key):
+    if not path or not os.path.exists(path):
+        return []
+    with open(path, 'r') as f:
+        data = json.load(f)
+    pairs = []
+    for item in data.get('lines_corrispondency', []):
+        if view1_key in item and view2_key in item:
+            pairs.append((int(item[view1_key]), int(item[view2_key])))
+    return pairs
+
+
+def scale_lines(lines, sx, sy):
+    if sx is None or sy is None:
+        return lines
+    out = []
+    for l in lines:
+        p1 = l['p1']
+        p2 = l['p2']
+        out.append({
+            'line_id': l['line_id'],
+            'p1': np.array([p1[0] * sx, p1[1] * sy], dtype=np.float32),
+            'p2': np.array([p2[0] * sx, p2[1] * sy], dtype=np.float32),
+        })
+    return out
+
+
+def build_line_alignment(lines_view1, lines_view2, correspondences,
+                         samples_per_line=7, ransac_thresh=5.0):
+    if not lines_view1 or not lines_view2 or not correspondences:
+        return None
+    lines1 = {l['line_id']: l for l in lines_view1}
+    lines2 = {l['line_id']: l for l in lines_view2}
+    src_pts = []
+    dst_pts = []
+    for lid1, lid2 in correspondences:
+        l1 = lines1.get(lid1)
+        l2 = lines2.get(lid2)
+        if l1 is None or l2 is None:
+            continue
+        p1a, p1b = l1['p1'], l1['p2']
+        p2a, p2b = l2['p1'], l2['p2']
+        if samples_per_line <= 1:
+            ts = [0.5]
+        else:
+            ts = [k / float(samples_per_line - 1) for k in range(samples_per_line)]
+        for t in ts:
+            p1 = p1a * (1.0 - t) + p1b * t
+            p2 = p2a * (1.0 - t) + p2b * t
+            dst_pts.append(p1)
+            src_pts.append(p2)
+    if len(src_pts) < 3:
+        return None
+    src = np.array(src_pts, dtype=np.float32)
+    dst = np.array(dst_pts, dtype=np.float32)
+    M, _ = cv.estimateAffinePartial2D(
+        src, dst, method=cv.RANSAC, ransacReprojThreshold=ransac_thresh
+    )
+    return M
+
+
+def apply_affine(M, pt):
+    if M is None or pt is None:
+        return None
+    x, y = float(pt[0]), float(pt[1])
+    return np.array([
+        M[0, 0] * x + M[0, 1] * y + M[0, 2],
+        M[1, 0] * x + M[1, 1] * y + M[1, 2]
+    ], dtype=np.float32)
+
+
+def draw_court_lines(img, lines, color=(0, 255, 0), thickness=2, label=True):
+    if img is None or not lines:
+        return img
+    for l in lines:
+        p1 = l['p1']
+        p2 = l['p2']
+        x1, y1 = int(round(p1[0])), int(round(p1[1]))
+        x2, y2 = int(round(p2[0])), int(round(p2[1]))
+        cv.line(img, (x1, y1), (x2, y2), color, thickness)
+        if label:
+            mx, my = (x1 + x2) // 2, (y1 + y2) // 2
+            cv.putText(img, str(l['line_id']), (mx + 4, my - 4),
+                       cv.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+    return img
+
+
+def _point_line_distance(pt, line):
+    p1 = line['p1']
+    p2 = line['p2']
+    v = p2 - p1
+    w = p1 - pt
+    denom = np.linalg.norm(v)
+    if denom <= 1e-6:
+        return 0.0
+    return float(abs(v[0] * w[1] - v[1] * w[0]) / denom)
+
+
+def _line_signature(pt, lines):
+    if pt is None or not lines:
+        return None
+    dists = np.array([_point_line_distance(pt, l) for l in lines], dtype=np.float32)
+    norm = np.linalg.norm(dists)
+    if norm <= 1e-6:
+        return None
+    return dists / norm
+
+
+def _smooth_penalty(value, threshold, margin, min_scale=0.4):
+    if value is None or threshold is None or margin is None or margin <= 0:
+        return 1.0
+    if value <= threshold:
+        return 1.0
+    if value >= threshold + margin:
+        return min_scale
+    t = (value - threshold) / margin
+    return 1.0 - t * (1.0 - min_scale)
+
+def detect_view(frame, frame_id, annotations, size, mask, det_model,
+                sahi_conf_threshold, sahi_iou_threshold, slice_h, slice_w,
+                slice_overlap, pose_model, pose_attempts, pose_conf_threshold,
+                pose_iou_threshold, tracker,
+                suppress_nested=True, nested_contain_thresh=0.9, nested_area_ratio=0.6):
+    detections = []
+    if frame_id in annotations:
+        for anno_file in annotations[frame_id]:
+            detections.extend(parse_yolo_annotations(
+                anno_file, size[0], size[1], frame, pose_model, pose_attempts,
+                pose_conf_threshold, pose_iou_threshold, tracker=tracker
+            ))
+    else:
+        roi = apply_trapezoid_mask(frame, mask)
+        mask_2d = np.any(roi > 0, axis=2)
+        if np.any(mask_2d):
+            coords = np.where(mask_2d)
+            min_y, max_y = coords[0].min(), coords[0].max()
+            min_x, max_x = coords[1].min(), coords[1].max()
+            cropped = roi[min_y:max_y + 1, min_x:max_x + 1]
+
+            preds = get_sliced_prediction(
+                cropped, det_model, slice_height=slice_h, slice_width=slice_w,
+                overlap_height_ratio=slice_overlap, overlap_width_ratio=slice_overlap,
+                postprocess_match_metric='IOU', postprocess_match_threshold=sahi_iou_threshold,
+                verbose=0
+            )
+
+            if preds and preds.object_prediction_list:
+                for p in preds.object_prediction_list:
+                    if p.category.id == 0 and p.score.value >= sahi_conf_threshold:
+                        bx1, by1, bx2, by2 = map(int, p.bbox.to_xyxy())
+                        bbox = (bx1 + min_x, by1 + min_y, bx2 + min_x, by2 + min_y)
+                        appearance = compute_team_appearence(frame, bbox)
+                        world_pos = tracker.project_to_world(bbox)
+                        detections.append({
+                            'bbox': bbox,
+                            'appearance': appearance,
+                            'world_pos': world_pos,
+                            'score': p.score.value
+                        })
+
+    if suppress_nested:
+        detections = _suppress_nested_detections(
+            detections,
+            contain_thresh=nested_contain_thresh,
+            area_ratio_thresh=nested_area_ratio
+        )
+
+    for d in detections:
+        if d.get('keypoints') is None:
+            kpts, vec = process_detection_pose(
+                frame, d['bbox'], pose_model, pose_attempts,
+                pose_conf_threshold, pose_iou_threshold
+            )
+            d['keypoints'] = kpts
+            d['pose_vec'] = vec
+        if d.get('keypoints') is not None:
+            kpts = d['keypoints']
+            candidates = []
+            for idx in (15, 16, 11, 12):
+                if idx < len(kpts):
+                    x, y = kpts[idx]
+                    if x > 0 and y > 0:
+                        candidates.append((x, y))
+            if candidates:
+                px, py = max(candidates, key=lambda p: p[1])
+                d['world_pos'] = tracker.project_pixel_to_world(px, py)
+
+    return detections
+
+
+def merge_track_global_id(tracker, track, target_gid, frame_id):
+    if track['global_id'] == target_gid:
+        return True
+    existing = tracker.global_id_to_track.get(target_gid)
+    if existing is not None and existing is not track:
+        return False
+    tracker.merge_global_ids(track['global_id'], target_gid, frame_id)
+    return True
+
+
+def _bbox_bottom_center(bbox):
+    x1, y1, x2, y2 = bbox
+    return np.array([(x1 + x2) / 2.0, y2], dtype=np.float32)
+
+
+def _reproj_error(tracker, world_pos, bbox):
+    if world_pos is None:
+        return None
+    px = tracker.project_to_pixel(world_pos)
+    if px is None:
+        return None
+    return float(np.linalg.norm(px - _bbox_bottom_center(bbox)))
+
+
+def _pose_anchor_pixel(track):
+    kpts = track.get('keypoints')
+    if kpts is None:
+        return None
+    candidates = []
+    for idx in (15, 16, 11, 12, 13, 14):
+        if idx < len(kpts):
+            x, y = kpts[idx]
+            if x > 0 and y > 0:
+                candidates.append((x, y))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p[1])
+
+
+def _track_anchor_pixel(track):
+    p = _pose_anchor_pixel(track)
+    if p is not None:
+        return np.array(p, dtype=np.float32)
+    bbox = track.get('bbox')
+    if bbox is None:
+        return None
+    return _bbox_bottom_center(bbox)
+
+
+def _triangulate_world_pos(tracker1, tracker2, p1, p2, max_reproj_error=50.0):
+    if not hasattr(tracker1, 'P') or not hasattr(tracker2, 'P'):
+        return None
+    p1 = np.array(p1, dtype=np.float32)
+    p2 = np.array(p2, dtype=np.float32)
+
+    if tracker1.is_rectified:
+        p1_norm = cv.undistortPoints(p1.reshape(1, 1, 2), tracker1.mtx, None, P=np.eye(3))
+        p2_norm = cv.undistortPoints(p2.reshape(1, 1, 2), tracker2.mtx, None, P=np.eye(3))
+    else:
+        p1_norm = cv.undistortPoints(p1.reshape(1, 1, 2), tracker1.mtx, tracker1.dist, P=np.eye(3))
+        p2_norm = cv.undistortPoints(p2.reshape(1, 1, 2), tracker2.mtx, tracker2.dist, P=np.eye(3))
+
+    p4d = cv.triangulatePoints(tracker1.P, tracker2.P,
+                               p1_norm.reshape(2, 1),
+                               p2_norm.reshape(2, 1))
+    p3d = (p4d[:3] / p4d[3]).flatten()
+
+    # Validate reprojection
+    pts_3d = np.array([p3d], dtype=np.float32)
+    img_pts1, _ = cv.projectPoints(pts_3d, tracker1.rvec, tracker1.tvec, tracker1.mtx, tracker1.dist)
+    img_pts2, _ = cv.projectPoints(pts_3d, tracker2.rvec, tracker2.tvec, tracker2.mtx, tracker2.dist)
+    err1 = np.linalg.norm(img_pts1[0][0] - p1)
+    err2 = np.linalg.norm(img_pts2[0][0] - p2)
+    if err1 > max_reproj_error or err2 > max_reproj_error:
+        return None
+    return p3d
+
+
+class AlignmentEstimator:
+    def __init__(self, min_pairs=50, update_every=50, max_pairs=2000):
+        self.min_pairs = min_pairs
+        self.update_every = update_every
+        self.max_pairs = max_pairs
+        self.pairs = []
+        self.scale = 1.0
+        self.rot = np.eye(2, dtype=np.float32)
+        self.trans = np.zeros(2, dtype=np.float32)
+        self.ready = False
+        self._count = 0
+
+    def add_pair(self, src_xy, dst_xy):
+        if src_xy is None or dst_xy is None:
+            return
+        self.pairs.append((np.array(src_xy[:2], dtype=np.float64),
+                           np.array(dst_xy[:2], dtype=np.float64)))
+        if len(self.pairs) > self.max_pairs:
+            self.pairs = self.pairs[-self.max_pairs:]
+        self._count += 1
+        if len(self.pairs) >= self.min_pairs and (self._count % self.update_every == 0):
+            self._fit()
+
+    def _fit(self):
+        X = np.array([p[1] for p in self.pairs], dtype=np.float64)  # dst
+        Y = np.array([p[0] for p in self.pairs], dtype=np.float64)  # src
+        muX = X.mean(axis=0)
+        muY = Y.mean(axis=0)
+        Xc = X - muX
+        Yc = Y - muY
+        H = Yc.T @ Xc
+        U, S, Vt = np.linalg.svd(H)
+        R = U @ Vt
+        if np.linalg.det(R) < 0:
+            Vt[-1, :] *= -1
+            R = U @ Vt
+        varY = (Yc ** 2).sum()
+        scale = (S.sum()) / varY if varY > 0 else 1.0
+        T = muX - scale * (R @ muY)
+        self.scale = float(scale)
+        self.rot = R.astype(np.float32)
+        self.trans = T.astype(np.float32)
+        self.ready = True
+
+    def transform(self, wp):
+        if wp is None:
+            return None
+        x, y = float(wp[0]), float(wp[1])
+        rx = self.scale * (self.rot[0][0] * x + self.rot[0][1] * y) + self.trans[0]
+        ry = self.scale * (self.rot[1][0] * x + self.rot[1][1] * y) + self.trans[1]
+        return np.array([rx, ry, 0.0], dtype=np.float32)
+
+
+class TrackletStore:
+    def __init__(self):
+        self.stats = {}
+
+    def update(self, view_id, tracks):
+        for t in tracks:
+            if not t.get('updated'):
+                continue
+            key = (view_id, t['track_id'])
+            s = self.stats.get(key)
+            if s is None:
+                s = {
+                    'count': 0,
+                    'app_sum': None,
+                    'app_count': 0,
+                    'pose_sum': None,
+                    'pose_count': 0,
+                    'world_sum': None,
+                    'world_count': 0,
+                    'anchor_gid': None
+                }
+                self.stats[key] = s
+            s['count'] += 1
+
+            if t.get('gid_source') == 'annotation' and s['anchor_gid'] is None:
+                s['anchor_gid'] = t.get('global_id')
+
+            app = t.get('appearance')
+            if app is not None:
+                if s['app_sum'] is None:
+                    s['app_sum'] = app.astype(np.float32).copy()
+                else:
+                    s['app_sum'] += app
+                s['app_count'] += 1
+
+            pose = t.get('pose_vec')
+            if pose is not None:
+                if s['pose_sum'] is None:
+                    s['pose_sum'] = pose.astype(np.float32).copy()
+                else:
+                    s['pose_sum'] += pose
+                s['pose_count'] += 1
+
+            wp = t.get('world_pos')
+            if wp is not None and len(wp) >= 2:
+                wp_arr = np.array([wp[0], wp[1], 0.0], dtype=np.float32)
+                if s['world_sum'] is None:
+                    s['world_sum'] = wp_arr.copy()
+                else:
+                    s['world_sum'] += wp_arr
+                s['world_count'] += 1
+
+    def get_features(self, view_id, track_id, min_len=5):
+        s = self.stats.get((view_id, track_id))
+        if not s:
+            return None
+        if s['anchor_gid'] is None and s['count'] < min_len:
+            return None
+
+        app = None
+        if s['app_count'] > 0:
+            app = s['app_sum'] / float(s['app_count'])
+            norm = np.linalg.norm(app)
+            if norm > 0:
+                app = app / norm
+
+        pose = None
+        if s['pose_count'] > 0:
+            pose = s['pose_sum'] / float(s['pose_count'])
+
+        wp = None
+        if s['world_count'] > 0:
+            wp = s['world_sum'] / float(s['world_count'])
+
+        return {
+            'appearance': app,
+            'pose_vec': pose,
+            'world_pos': wp,
+            'anchor_gid': s['anchor_gid']
+        }
+
+    def get_anchor_gid(self, view_id, track_id):
+        s = self.stats.get((view_id, track_id))
+        if not s:
+            return None
+        return s.get('anchor_gid')
+
+
+def associate_tracks_to_view1(tracker1, tracker_other, frame_id,
+                              match_threshold, app_weight=0.4, world_weight=0.6,
+                              max_world_dist=None, world_dist_tolerance=0.0,
+                              reproj_max_px=120.0, reproj_soft_margin=40.0,
+                              pixel_align=None, pixel_dist_max=None,
+                              pixel_dist_soft_margin=40.0,
+                              line_sig_lines_anchor=None, line_sig_lines_other=None,
+                              line_sig_thresh=0.15,
+                              line_sig_debug_frames=None,
+                              prev_assoc=None, sticky_bonus=0.08,
+                              conflict_log=None, conflict_view_id=None,
+                              view_id_other=None,
+                              tracklet_min_frames=5,
+                              tracklet_store=None,
+                              use_pose_triangulation=True,
+                              pose_triangulation_max_reproj=50.0,
+                              always_overwrite_gid=False,
+                              align_estimator=None,
+                              anchor_view_id=1,):
+    active1 = [t for t in tracker1.tracks if t['updated']]
+    active_other = [t for t in tracker_other.tracks if t['updated']]
+
+    if not active1 or not active_other:
+        return
+
+    pose_points1 = []
+    pose_points2 = []
+    if use_pose_triangulation:
+        for t in active1:
+            pose_points1.append(_pose_anchor_pixel(t))
+        for t in active_other:
+            pose_points2.append(_pose_anchor_pixel(t))
+
+    w_norm = app_weight + world_weight
+    if w_norm == 0:
+        return
+    app_weight /= w_norm
+    world_weight /= w_norm
+
+    line_sigs_1 = None
+    line_sigs_2 = None
+    if line_sig_lines_anchor and line_sig_lines_other:
+        line_sigs_1 = []
+        for t in active1:
+            p1_px = _track_anchor_pixel(t)
+            line_sigs_1.append(_line_signature(p1_px, line_sig_lines_anchor))
+        line_sigs_2 = []
+        for t in active_other:
+            p2_px = _track_anchor_pixel(t)
+            line_sigs_2.append(_line_signature(p2_px, line_sig_lines_other))
+
+    cost = np.zeros((len(active1), len(active_other)), dtype=np.float32)
+    for i, t1 in enumerate(active1):
+        for j, t2 in enumerate(active_other):
+            anchor_gid1 = tracklet_store.get_anchor_gid(anchor_view_id, t1['track_id']) if tracklet_store else None
+            anchor_gid2 = tracklet_store.get_anchor_gid(view_id_other, t2['track_id']) if tracklet_store else None
+            t1_annot = t1.get('gid_source') == 'annotation' or anchor_gid1 is not None
+            t2_annot = t2.get('gid_source') == 'annotation' or anchor_gid2 is not None
+            gid1 = anchor_gid1 if anchor_gid1 is not None else t1.get('global_id')
+            gid2 = anchor_gid2 if anchor_gid2 is not None else t2.get('global_id')
+            if t1_annot and t2_annot and gid1 != gid2:
+                if conflict_log is not None:
+                    conflict_log.append({
+                        'frame': frame_id,
+                        'view': conflict_view_id,
+                        'view1_track_id': t1['track_id'],
+                        'view1_global_id': gid1,
+                        'other_track_id': t2['track_id'],
+                        'other_global_id': gid2,
+                        'reason': 'annotated_gid_mismatch'
+                    })
+                # Hard-force annotations: anchor view wins even if mismatched
+                cost[i, j] = 0.0
+                continue
+            elif t1_annot and t2_annot and gid1 == gid2:
+                cost[i, j] = 0.0
+                continue
+            app1 = t1.get('appearance')
+            app2 = t2.get('appearance')
+            pose1 = t1.get('pose_vec')
+            pose2 = t2.get('pose_vec')
+            wp1 = t1.get('world_pos')
+            wp2 = t2.get('world_pos')
+
+            if tracklet_store is not None:
+                f1 = tracklet_store.get_features(anchor_view_id, t1['track_id'], tracklet_min_frames)
+                if f1 is not None:
+                    if f1.get('appearance') is not None:
+                        app1 = f1['appearance']
+                    if f1.get('pose_vec') is not None:
+                        pose1 = f1['pose_vec']
+                    if f1.get('world_pos') is not None:
+                        wp1 = f1['world_pos']
+                f2 = tracklet_store.get_features(view_id_other, t2['track_id'], tracklet_min_frames)
+                if f2 is not None:
+                    if f2.get('appearance') is not None:
+                        app2 = f2['appearance']
+                    if f2.get('pose_vec') is not None:
+                        pose2 = f2['pose_vec']
+                    if f2.get('world_pos') is not None:
+                        wp2 = f2['world_pos']
+
+            app_sim = tracker1._appearance_sim(app1, app2)
+
+            if use_pose_triangulation:
+                p1 = pose_points1[i]
+                p2 = pose_points2[j]
+                if p1 is not None and p2 is not None:
+                    tri = _triangulate_world_pos(
+                        tracker1, tracker_other, p1, p2,
+                        max_reproj_error=pose_triangulation_max_reproj
+                    )
+                    if tri is not None:
+                        wp1 = tri
+                        wp2 = tri
+                        if align_estimator is not None and view_id_other == 2:
+                            # Use triangulated points as target to align view2 world positions
+                            align_estimator.add_pair(t2.get('world_pos'), tri)
+
+            if align_estimator is not None and align_estimator.ready and view_id_other == 2:
+                wp2 = align_estimator.transform(wp2)
+
+            world_sim = tracker1._world_pos_sim(wp1, wp2)
+            
+            sim = app_weight * app_sim + world_weight * world_sim
+
+            if line_sigs_1 is not None and line_sigs_2 is not None:
+                sig1 = line_sigs_1[i]
+                sig2 = line_sigs_2[j]
+                if sig1 is not None and sig2 is not None:
+                    sig_dist = float(np.linalg.norm(sig1 - sig2))
+                    if line_sig_debug_frames is not None and frame_id in line_sig_debug_frames:
+                        print(
+                            f"[line_sig] frame={frame_id} view_other={view_id_other} "
+                            f"t1={t1.get('track_id')} t2={t2.get('track_id')} "
+                            f"gid1={t1.get('global_id')} gid2={t2.get('global_id')} "
+                            f"dist={sig_dist:.4f} thresh={line_sig_thresh}"
+                        )
+                    if sig_dist > line_sig_thresh:
+                        cost[i, j] = 1.0 - sim + 1.0
+                        continue
+
+            if wp1 is not None and wp2 is not None:
+                dist = np.linalg.norm(np.array(wp1[:2]) - np.array(wp2[:2]))
+                if max_world_dist is not None and dist > (max_world_dist + world_dist_tolerance):
+                    sim *= _smooth_penalty(
+                        dist, max_world_dist + world_dist_tolerance,
+                        max(1.0, world_dist_tolerance), min_scale=0.4
+                    )
+
+                if reproj_max_px is not None:
+                    err_1 = _reproj_error(tracker1, wp2, t1['bbox'])
+                    err_2 = _reproj_error(tracker_other, wp1, t2['bbox'])
+                    worst_err = max(e for e in (err_1, err_2) if e is not None) if (err_1 or err_2) else None
+                    if worst_err is not None:
+                        if worst_err > (reproj_max_px - reproj_soft_margin):
+                            sim *= _smooth_penalty(
+                                worst_err, reproj_max_px - reproj_soft_margin,
+                                reproj_soft_margin, min_scale=0.4
+                            )
+
+            if prev_assoc is not None:
+                prev_gid = prev_assoc.get(t2['track_id'])
+                if prev_gid is not None and prev_gid == t1['global_id']:
+                    sim = min(1.0, sim + sticky_bonus)
+                if t2_annot and gid1 == gid2:
+                    sim = min(1.0, sim + 0.2)
+
+            cost[i, j] = 1.0 - sim
+
+    row_ind, col_ind = linear_sum_assignment(cost)
+    matched_other_ids = set()
+    for r, c in zip(row_ind, col_ind):
+        if cost[r, c] <= (1.0 - match_threshold):
+            t1 = active1[r]
+            t2 = active_other[c]
+            sim = 1.0 - cost[r, c]
+            # Decide target GID
+            anchor_gid1 = tracklet_store.get_anchor_gid(anchor_view_id, t1['track_id']) if tracklet_store else None
+            anchor_gid2 = tracklet_store.get_anchor_gid(view_id_other, t2['track_id']) if tracklet_store else None
+            t1_annot = t1.get('gid_source') == 'annotation' or anchor_gid1 is not None
+            t2_annot = t2.get('gid_source') == 'annotation' or anchor_gid2 is not None
+            if t2_annot and not t1_annot:
+                target_gid = anchor_gid2 if anchor_gid2 is not None else t2['global_id']
+            elif t1_annot and not t2_annot:
+                target_gid = anchor_gid1 if anchor_gid1 is not None else t1['global_id']
+            elif t1_annot and t2_annot:
+                target_gid = anchor_gid1 if anchor_gid1 is not None else t1['global_id']
+            else:
+                if always_overwrite_gid:
+                    s1 = t1.get('start_frame', frame_id)
+                    s2 = t2.get('start_frame', frame_id)
+                    if s2 < s1:
+                        target_gid = t2['global_id']
+                    else:
+                        target_gid = t1['global_id']
+                else:
+                    target_gid = t1['global_id']
+
+            merge_track_global_id(tracker1, t1, target_gid, frame_id)
+            merge_track_global_id(tracker_other, t2, target_gid, frame_id)
+            if t2_annot and not t1_annot:
+                t1['gid_source'] = 'annotation'
+            matched_other_ids.add(t2['track_id'])
+            if prev_assoc is not None:
+                prev_assoc[t2['track_id']] = t2['global_id'] if t2.get('gid_source') == 'annotation' else t1['global_id']
+
+    if prev_assoc is not None:
+        active_other_ids = {t['track_id'] for t in active_other}
+        for tid in list(prev_assoc.keys()):
+            if tid not in active_other_ids:
+                del prev_assoc[tid]
+
+
 def yolo_sahi_pose_tracking(
     source1,
     source2,
-    source3=None,
     calib_path1=None,
     calib_path2=None,
-    calib_path3=None,
     annotations_dir1=None,
     annotations_dir2=None,
-    annotations_dir3=None,
-    output_path1='yolo_sahi_pose_tracking_view1.mp4',
-    output_path2='yolo_sahi_pose_tracking_view2.mp4',
-    output_path3='yolo_sahi_pose_tracking_view3.mp4',
+    output_path1='output_view1.mp4',
+    output_path2='output_view2.mp4',
     output_csv_path1='track_events_view1.csv',
     output_csv_path2='track_events_view2.csv',
-    output_csv_path3='track_events_view3.csv',
     start_frame=0,
+    auto_start_from_annotations=True,
     enable_pose=True,
     size=(1440, 810),
     # detection View 1
-    sahi_conf_threshold1=0.6,
-    sahi_iou_threshold1=0.55,
-    slice_h1=640,
-    slice_w1=640,
-    slice_overlap1=0.15,
+    sahi_conf_threshold1=0.45,
+    sahi_iou_threshold1=0.40,
+    slice_h1=480,
+    slice_w1=480,
+    slice_overlap1=0.3,
     # pose View 1
-    pose_conf_threshold1=0.15,
+    pose_conf_threshold1=0.09,
     pose_iou_threshold1=0.02,
     pose_attempts1=(
         {'pad': 0.0, 'conf': None, 'iou': None},
-        {'pad': 0.25, 'conf': 0.1, 'iou': 0.005},
+        {'pad': 0.25, 'conf': 0.03, 'iou': 0.005},
     ),
     # tracker View 1
-    match_threshold1=0.25,
-    iou_weight1=0.27,
-    appearance_weight1=0.45,
-    pose_weight1=0,
-    max_missed_frames1=300,
+    match_threshold1=0.45,
+    iou_weight1=0.50,
+    appearance_weight1=0.35,
+    pose_weight1=0.0,
     ema_alpha1=0.5,
-    max_velocity1=1000.0, # max units moved per frame for View 1
+    max_velocity1=500.0,
+    suppress_nested_tracks1=True,
+    nested_track_contain_thresh1=0.9,
+    nested_track_area_ratio1=0.6,
+    nested_track_app_sim1=0.7,
+    cross_view_match_threshold1=0.15,
+    world_dist_weight1=0.5,
+    world_dist_tolerance1=150.0,
+    reproj_max_px1=120.0,
+    reproj_soft_margin1=40.0,
+    max_missed_frames1=80,
     # detection View 2
-    sahi_conf_threshold2=0.15,
-    sahi_iou_threshold2=0.25,
-    slice_h2=480,
-    slice_w2=480,
-    slice_overlap2=0.6,
+    sahi_conf_threshold2=0.7,
+    sahi_iou_threshold2=0.55,
+    slice_h2=640,
+    slice_w2=640,
+    slice_overlap2=0.05,
     # pose View 2
-    pose_conf_threshold2=0.09,
+    pose_conf_threshold2=0.15,
     pose_iou_threshold2=0.02,
     pose_attempts2=(
         {'pad': 0.0, 'conf': None, 'iou': None},
-        {'pad': 0.25, 'conf': 0.03, 'iou': 0.005},
+        {'pad': 0.25, 'conf': 0.01, 'iou': 0.005},
     ),
     # tracker View 2
-    match_threshold2=0.25,
-    iou_weight2=0.30,
-    appearance_weight2=0.45,
-    pose_weight2=0,
-    max_missed_frames2=60,
+    match_threshold2=0.35,
+    iou_weight2=0.45,
+    appearance_weight2=0.35,
+    pose_weight2=0.0,
     ema_alpha2=0.5,
-    max_velocity2=1000.0, # max units moved per frame for View 2
-    cross_view_match_threshold1=0.2,
-    cross_view_match_threshold2=0.2,
-    world_dist_weight1=0.9,
-    world_dist_weight2=0.9,
-    re_entry_proximity_threshold=700.0,
-    # detection View 3
-    sahi_conf_threshold3=0.6,
-    sahi_iou_threshold3=0.55,
-    slice_h3=640,
-    slice_w3=640,
-    slice_overlap3=0.15,
-    # pose View 3
-    pose_conf_threshold3=0.15,
-    pose_iou_threshold3=0.02,
-    pose_attempts3=(
-        {'pad': 0.0, 'conf': None, 'iou': None},
-        {'pad': 0.25, 'conf': 0.1, 'iou': 0.005},
-    ),
-    # tracker View 3
-    match_threshold3=0.25,
-    iou_weight3=0.27,
-    appearance_weight3=0.45,
-    pose_weight3=0,
-    max_missed_frames3=300,
-    ema_alpha3=0.5,
-    max_velocity3=10000.0, # max units moved per frame for View 3
-    cross_view_match_threshold3=0.2,
-    world_dist_weight3=0.9
+    max_velocity2=500.0,
+    suppress_nested_tracks2=True,
+    nested_track_contain_thresh2=0.9,
+    nested_track_area_ratio2=0.6,
+    nested_track_app_sim2=0.7,
+    cross_view_match_threshold2=0.15,
+    world_dist_weight2=0.5,
+    world_dist_tolerance2=150.0,
+    reproj_max_px2=120.0,
+    reproj_soft_margin2=40.0,
+    max_missed_frames2=300,
+    # tracklet-based reid
+    tracklet_min_frames=5,
+    use_pose_triangulation=True,
+    pose_triangulation_max_reproj=50.0,
+    suppress_nested_detections=True,
+    nested_contain_thresh=0.9,
+    nested_area_ratio=0.6,
+    always_overwrite_gid=True,
+    align_from_triangulation=True,
+    align_min_pairs=50,
+    align_update_every=50,
+    align_max_pairs=2000,
+    # line-based alignment + debug
+    court_lines_path1=None,
+    court_lines_path2=None,
+    court_corners_path1=None,
+    court_corners_path2=None,
+    court_line_correspondence_path=None,
+    court_line_view1_key='line_id_cam13',
+    court_line_view2_key='line_id_cam4',
+    draw_court_lines_debug=True,
+    align_pixel_max_dist=120.0,
+    align_pixel_soft_margin=40.0,
+    align_pixel_samples=7,
+    align_pixel_ransac_thresh=5.0,
+    line_sig_debug_frames=(12,),
+    # logging
+    conflict_log_path='annotation_conflicts.csv'
 ):
     """
-    Main pipeline for multi-view person tracking using YOLO, SAHI, and Pose estimation.
-    
-    Parameters:
-        source1, source2: Paths to the input video files for view 1 and view 2.
-        calib_path1, calib_path2: Paths to JSON files containing camera calibration parameters.
-        annotations_dir1, 2: Paths to directories containing YOLO-format txt files for multiple frames.
-                              Filenames should contain 'frame_XXXX' where XXXX is the frame number (0-based).
-                              Used to provide ground truth detections for specific frames.
-        output_path1, 2: Filenames for the processed output videos.
-        output_csv_path1, 2: Filenames for saving track events (add, lost, refound).
-        start_frame: 0-based frame number to start processing from (default 0).
-        size: Tuple (width, height) to which input frames are resized.
-        
-        SAHI Parameters (sahi_conf, sahi_iou, slice_h, slice_w, slice_overlap):
-            - sahi_conf_threshold: Confidence threshold for person detection in slices.
-            - sahi_iou_threshold: IoU threshold for NMS after merging slice predictions.
-            - slice_h, slice_w: Dimensions of the slices for SAHI.
-            - slice_overlap: Overlap ratio between adjacent slices.
-            
-        Pose Parameters (pose_conf, pose_iou, pose_attempts):
-            - pose_conf_threshold: Minimum confidence for keypoint detection.
-            - pose_attempts: List of dictionaries defining padding and thresholds for multiple 
-                             pose estimation retries if the first one fails.
-                             
-        Tracker Parameters (match_threshold, weights, max_missed, ema_alpha):
-            - match_threshold: Minimum similarity to maintain a track.
-            - iou_weight: Importance of bounding box overlap.
-            - appearance_weight: Importance of visual similarity.
-            - pose_weight: Importance of pose consistency.
-            - max_missed_frames: Grace period for a track before it is considered lost.
-            - ema_alpha: Update rate for the appearance feature vector.
-            - max_velocity: Maximum physical distance a person can travel between frames.
-                           Used to prevent physically impossible re-identifications.
+    Multi-view tracking with single-view tracking + cross-view association.
+
+    Flow:
+    - Detect per-view and estimate pose
+    - Track per-view independently
+    - Associate tracks across views using appearance + 3D position
     """
-    print("Starting yolo_sahi_pose_tracking")
-    # skeleton connections (YOLO format)
+    print("Starting FIXED yolo_sahi_pose_tracking")
+    
+    # Skeleton connections
     connections = [
         (0,1),(0,2),(1,3),(2,4),
         (5,6),(5,7),(6,8),(7,9),(8,10),
@@ -421,51 +1112,19 @@ def yolo_sahi_pose_tracking(
     pose_model = YOLO('yolo11x-pose.pt') if enable_pose else None
     print("Models loaded successfully")
 
+    # Load calibrations
     calib1 = load_calibration(calib_path1)
     calib2 = load_calibration(calib_path2)
-    calib3 = load_calibration(calib_path3) if source3 else None
 
     video_prefix1 = os.path.basename(source1).split('.')[0] if source1 else None
     video_prefix2 = os.path.basename(source2).split('.')[0] if source2 else None
-    video_prefix3 = os.path.basename(source3).split('.')[0] if source3 else None
 
     shared_id_manager = GlobalIDManager()
 
-    def match_detections(dets_a, dets_b, tracker_a, tracker_b, match_threshold, shared_id_manager):
-        if not dets_a or not dets_b:
-            return set(), set()
-        cross_costs = np.zeros((len(dets_a), len(dets_b)), dtype=np.float32)
-        for i, da in enumerate(dets_a):
-            for j, db in enumerate(dets_b):
-                sim = tracker_a._cross_view_similarity(da, db)
-                cross_costs[i, j] = 1.0 - sim
-        row_ind, col_ind = linear_sum_assignment(cross_costs)
-        matched_a = set()
-        matched_b = set()
-        for r, c in zip(row_ind, col_ind):
-            if cross_costs[r, c] <= 1.0 - match_threshold:
-                da = dets_a[r]
-                db = dets_b[c]
-                p3d = IOUTracker.triangulate(tracker_a, tracker_b, da['bbox'], db['bbox'])
-                if p3d is not None:
-                    da['world_pos'] = p3d
-                    db['world_pos'] = p3d
-                if 'global_id' not in da and 'global_id' not in db:
-                    gid = shared_id_manager.next_id()
-                    da['global_id'] = gid
-                    db['global_id'] = gid
-                elif 'global_id' in da and 'global_id' not in db:
-                    db['global_id'] = da['global_id']
-                elif 'global_id' in db and 'global_id' not in da:
-                    da['global_id'] = db['global_id']
-                matched_a.add(r)
-                matched_b.add(c)
-        return matched_a, matched_b
-
-    # Two trackers, one for each view
+    # FIX: Create trackers with unified max_missed_frames and is_rectified=True
     tracker1 = IOUTracker(
         match_threshold=match_threshold1,
-        max_missed_frames=max_missed_frames1,
+        max_missed_frames=max_missed_frames1,  # Unified
         iou_weight=iou_weight1,
         appearance_weight=appearance_weight1,
         pose_weight=pose_weight1,
@@ -474,11 +1133,18 @@ def yolo_sahi_pose_tracking(
         camera_params=calib1,
         global_id_manager=shared_id_manager,
         cross_view_match_threshold=cross_view_match_threshold1,
-        world_dist_weight=world_dist_weight1
+        world_dist_weight=world_dist_weight1,
+        world_dist_tolerance=world_dist_tolerance1,
+        is_rectified=True,  # FIX: Videos are rectified
+        suppress_nested_tracks=suppress_nested_tracks1,
+        nested_contain_thresh=nested_track_contain_thresh1,
+        nested_area_ratio=nested_track_area_ratio1,
+        nested_app_sim_thresh=nested_track_app_sim1
     )
-    tracker2 = IOUTracker( # new tracker for view 2
+    
+    tracker2 = IOUTracker(
         match_threshold=match_threshold2,
-        max_missed_frames=max_missed_frames2,
+        max_missed_frames=max_missed_frames2,  # Unified
         iou_weight=iou_weight2,
         appearance_weight=appearance_weight2,
         pose_weight=pose_weight2,
@@ -487,549 +1153,425 @@ def yolo_sahi_pose_tracking(
         camera_params=calib2,
         global_id_manager=shared_id_manager,
         cross_view_match_threshold=cross_view_match_threshold2,
-        world_dist_weight=world_dist_weight2
+        world_dist_weight=world_dist_weight2,
+        world_dist_tolerance=world_dist_tolerance2,
+        is_rectified=True,  # FIX: Videos are rectified
+        suppress_nested_tracks=suppress_nested_tracks2,
+        nested_contain_thresh=nested_track_contain_thresh2,
+        nested_area_ratio=nested_track_area_ratio2,
+        nested_app_sim_thresh=nested_track_app_sim2
     )
-    tracker3 = IOUTracker( # new tracker for view 3
-        match_threshold=match_threshold3,
-        max_missed_frames=max_missed_frames3,
-        iou_weight=iou_weight3,
-        appearance_weight=appearance_weight3,
-        pose_weight=pose_weight3,
-        ema_alpha=ema_alpha3,
-        max_velocity=max_velocity3,
-        camera_params=calib3,
-        global_id_manager=shared_id_manager,
-        cross_view_match_threshold=cross_view_match_threshold3,
-        world_dist_weight=world_dist_weight3
-    ) if source3 else None
 
+    align_estimator = None
+    if align_from_triangulation:
+        align_estimator = AlignmentEstimator(
+            min_pairs=align_min_pairs,
+            update_every=align_update_every,
+            max_pairs=align_max_pairs
+        )
+    tracklet_store = None
+
+    # Open videos
     cap1 = cv.VideoCapture(source1)
-    cap2 = cv.VideoCapture(source2) # new capture for view 2
-    cap3 = cv.VideoCapture(source3) if source3 else None
+    cap2 = cv.VideoCapture(source2)
 
     fps1 = int(cap1.get(cv.CAP_PROP_FPS)) or 25
     fps2 = int(cap2.get(cv.CAP_PROP_FPS)) or 25
-    fps3 = int(cap3.get(cv.CAP_PROP_FPS)) or 25 if cap3 else 25
-    # For now, assuming both videos have the same FPS and are synchronized
-    if fps1 != fps2:
-        print("warning: video fps mismatch, assuming synchronized playback.")
 
+    # Create masks
     mask1, _ = create_trapezoid_mask((size[1], size[0]),
-                                           TRAPEZ_TOP_LEFT_1, TRAPEZ_TOP_RIGHT_1, TRAPEZ_BOTTOM_LEFT_1, TRAPEZ_BOTTOM_RIGHT_1, CURVE_HEIGHT_1)
+                                    TRAPEZ_TOP_LEFT_1, TRAPEZ_TOP_RIGHT_1, 
+                                    TRAPEZ_BOTTOM_LEFT_1, TRAPEZ_BOTTOM_RIGHT_1, 
+                                    CURVE_HEIGHT_1)
     mask2, _ = create_trapezoid_mask((size[1], size[0]),
-                                           TRAPEZ_TOP_LEFT_2, TRAPEZ_TOP_RIGHT_2, TRAPEZ_BOTTOM_LEFT_2, TRAPEZ_BOTTOM_RIGHT_2, CURVE_HEIGHT_2)
-    mask3, _ = create_trapezoid_mask((size[1], size[0]),
-                                           TRAPEZ_TOP_LEFT_3, TRAPEZ_TOP_RIGHT_3, TRAPEZ_BOTTOM_LEFT_3, TRAPEZ_BOTTOM_RIGHT_3, CURVE_HEIGHT_3) if source3 else (None, None)
+                                    TRAPEZ_TOP_LEFT_2, TRAPEZ_TOP_RIGHT_2, 
+                                    TRAPEZ_BOTTOM_LEFT_2, TRAPEZ_BOTTOM_RIGHT_2, 
+                                    CURVE_HEIGHT_2)
+    # Create video writers
+    writer1 = cv.VideoWriter(output_path1, cv.VideoWriter_fourcc(*'mp4v'), fps1, size)
+    writer2 = cv.VideoWriter(output_path2, cv.VideoWriter_fourcc(*'mp4v'), fps2, size)
 
-    writer1 = cv.VideoWriter(
-        output_path1,
-        cv.VideoWriter_fourcc(*'mp4v'), fps1, size
-    )
-    writer2 = cv.VideoWriter( # new writer for view 2
-        output_path2,
-        cv.VideoWriter_fourcc(*'mp4v'), fps2, size
-    )
-    writer3 = cv.VideoWriter( # new writer for view 3
-        output_path3,
-        cv.VideoWriter_fourcc(*'mp4v'), fps3, size
-    ) if source3 else None
-
+    # Create CSV writers
     csv_file1 = open(output_csv_path1, 'w', newline='')
-    csv_writer1 = csv.DictWriter(csv_file1, fieldnames=['frame', 'track_id', 'event', 'view', 'global_id', 'matched_with_other_view_track_id', 'new_global_id', 'old_global_id'])
+    csv_writer1 = csv.DictWriter(csv_file1, fieldnames=['frame', 'track_id', 'event', 'view', 'global_id', 'matched_with_other_view_track_id', 'new_global_id', 'old_global_id', 'world_x', 'world_y', 'world_z', 'world_pos_json', 'has_world_pos'])
     csv_writer1.writeheader()
 
     csv_file2 = open(output_csv_path2, 'w', newline='')
-    csv_writer2 = csv.DictWriter(csv_file2, fieldnames=['frame', 'track_id', 'event', 'view', 'global_id', 'matched_with_other_view_track_id', 'new_global_id', 'old_global_id'])
+    csv_writer2 = csv.DictWriter(csv_file2, fieldnames=['frame', 'track_id', 'event', 'view', 'global_id', 'matched_with_other_view_track_id', 'new_global_id', 'old_global_id', 'world_x', 'world_y', 'world_z', 'world_pos_json', 'has_world_pos'])
     csv_writer2.writeheader()
 
-    csv_file3 = open(output_csv_path3, 'w', newline='') if source3 else None
-    csv_writer3 = csv.DictWriter(csv_file3, fieldnames=['frame', 'track_id', 'event', 'view', 'global_id', 'matched_with_other_view_track_id', 'new_global_id', 'old_global_id']) if csv_file3 else None
-    if csv_writer3: csv_writer3.writeheader()
 
-    # Load annotations for all frames
-    annotations1 = load_annotations_from_dir(annotations_dir1, video_prefix1, size[0], size[1], pose_model, pose_attempts1, pose_conf_threshold1, pose_iou_threshold1, tracker1)
-    annotations2 = load_annotations_from_dir(annotations_dir2, video_prefix2, size[0], size[1], pose_model, pose_attempts2, pose_conf_threshold2, pose_iou_threshold2, tracker2)
-    annotations3 = load_annotations_from_dir(annotations_dir3, video_prefix3, size[0], size[1], pose_model, pose_attempts3, pose_conf_threshold3, pose_iou_threshold3, tracker3) if source3 else {}
+    # Load annotations
+    annotations1 = load_annotations_from_dir(annotations_dir1, video_prefix1)
+    annotations2 = load_annotations_from_dir(annotations_dir2, video_prefix2)
+    if auto_start_from_annotations:
+        first_annot_frame = _min_annotated_frame(annotations1, annotations2)
+        if first_annot_frame is not None and start_frame < first_annot_frame:
+            start_frame = first_annot_frame
 
     frame_id = start_frame
-    fps_hist = deque(maxlen=30)  # Use deque for efficient FPS history (fixed size)
+    fps_hist = deque(maxlen=30)
+    prev_assoc_v2 = {}
+    prev_assoc_v1 = {}
+    conflict_log = []
+    conflict_writer = None
+    conflict_file = None
+    if conflict_log_path:
+        conflict_file = open(conflict_log_path, 'w', newline='')
+        conflict_writer = csv.DictWriter(conflict_file, fieldnames=[
+            'frame', 'view', 'view1_track_id', 'view1_global_id',
+            'other_track_id', 'other_global_id', 'reason'
+        ])
+        conflict_writer.writeheader()
 
-    # Skip frames before start_frame
+    # Skip to start_frame
     for _ in range(start_frame):
         cap1.read()
         cap2.read()
 
-    # Process initial frame with annotations
+    # ===== PROCESS INITIAL FRAME =====
     ok1, frame1 = cap1.read()
     ok2, frame2 = cap2.read()
-    ok3, frame3 = cap3.read() if cap3 else (False, None)
-    if not (ok1 and ok2) or (cap3 and not ok3):
-        print(f"error: could not read initial frames. cap1: {ok1}, cap2: {ok2}, cap3: {ok3 if cap3 else 'N/A'}")
+    
+    if not (ok1 and ok2):
+        print("Error: Could not read initial frames")
         return
 
+    orig_h1, orig_w1 = frame1.shape[:2]
+    orig_h2, orig_w2 = frame2.shape[:2]
     frame1 = cv.resize(frame1, size)
     frame2 = cv.resize(frame2, size)
-    if frame3 is not None:
-        frame3 = cv.resize(frame3, size)
+    print(f"Processing initial frame {frame_id}")
 
-    print(f"loading initial annotations for frame {frame_id} from {annotations_dir1}")
-    print(f"  Frame size: {frame1.shape}, Processing size: {size[0]}x{size[1]}")
-    initial_detections1 = []
-    if frame_id in annotations1:
-        for anno_file in annotations1[frame_id]:
-            initial_detections1.extend(parse_yolo_annotations(
-                anno_file, size[0], size[1], frame1, pose_model, pose_attempts1, pose_conf_threshold1, pose_iou_threshold1, tracker=tracker1
-            ))
-    print(f"loading initial annotations for frame {frame_id} from {annotations_dir2}")
-    print(f"  Frame size: {frame2.shape}, Processing size: {size[0]}x{size[1]}")
-    initial_detections2 = []
-    if frame_id in annotations2:
-        for anno_file in annotations2[frame_id]:
-            initial_detections2.extend(parse_yolo_annotations(
-                anno_file, size[0], size[1], frame2, pose_model, pose_attempts2, pose_conf_threshold2, pose_iou_threshold2, tracker=tracker2
-            ))
+    line_debug1 = []
+    line_debug2 = []
+    common_lines_1 = []
+    common_lines_2 = []
+    pixel_align_21 = None
+    pixel_align_12 = None
+    if court_lines_path1 and court_lines_path2 and court_corners_path1 and court_corners_path2 and court_line_correspondence_path:
+        sx1 = size[0] / float(orig_w1) if orig_w1 > 0 else 1.0
+        sy1 = size[1] / float(orig_h1) if orig_h1 > 0 else 1.0
+        sx2 = size[0] / float(orig_w2) if orig_w2 > 0 else 1.0
+        sy2 = size[1] / float(orig_h2) if orig_h2 > 0 else 1.0
 
-    print(f"loading initial annotations for frame {frame_id} from {annotations_dir3}")
-    initial_detections3 = []
-    if source3 and frame_id in annotations3:
-        for anno_file in annotations3[frame_id]:
-            initial_detections3.extend(parse_yolo_annotations(
-                anno_file, size[0], size[1], frame3, pose_model, pose_attempts3, pose_conf_threshold3, pose_iou_threshold3, tracker=tracker3
-            ))
+        pts1 = load_indexed_points(court_corners_path1)
+        pts2 = load_indexed_points(court_corners_path2)
+        lines1 = load_court_lines(court_lines_path1, pts1)
+        lines2 = load_court_lines(court_lines_path2, pts2)
+        line_debug1 = scale_lines(lines1, sx1, sy1)
+        line_debug2 = scale_lines(lines2, sx2, sy2)
 
-    # Store initial counts and IDs
-    all_initial_gids = set([d['global_id'] for d in initial_detections1] + [d['global_id'] for d in initial_detections2] + ([d['global_id'] for d in initial_detections3] if initial_detections3 else []))
-    max_total_players = None # No limit on max detections/tracks
-    print(f"Total unique players in initial annotations: {len(all_initial_gids)}. No max_tracks limit.")
-    # Update trackers with max_tracks
-    tracker1.max_tracks = max_total_players
-    tracker2.max_tracks = max_total_players
+        corr = load_line_correspondences(
+            court_line_correspondence_path, court_line_view1_key, court_line_view2_key
+        )
+        lines1_by_id = {l['line_id']: l for l in line_debug1}
+        lines2_by_id = {l['line_id']: l for l in line_debug2}
+        for lid1, lid2 in corr:
+            l1 = lines1_by_id.get(lid1)
+            l2 = lines2_by_id.get(lid2)
+            if l1 is not None and l2 is not None:
+                common_lines_1.append(l1)
+                common_lines_2.append(l2)
+        pixel_align_21 = build_line_alignment(
+            line_debug1, line_debug2, corr,
+            samples_per_line=align_pixel_samples,
+            ransac_thresh=align_pixel_ransac_thresh
+        )
+        if pixel_align_21 is not None:
+            pixel_align_12 = cv.invertAffineTransform(pixel_align_21)
 
-    # Add world_pos to initial detections
-    for d in initial_detections1:
-        d['world_pos'] = tracker1.project_to_world(d['bbox'])
-    for d in initial_detections2:
-        d['world_pos'] = tracker2.project_to_world(d['bbox'])
-    for d in initial_detections3:
-        d['world_pos'] = tracker3.project_to_world(d['bbox'])
+    initial_detections1 = detect_view(
+        frame1, frame_id, annotations1, size, mask1, det_model,
+        sahi_conf_threshold1, sahi_iou_threshold1, slice_h1, slice_w1,
+        slice_overlap1, pose_model, pose_attempts1, pose_conf_threshold1,
+        pose_iou_threshold1, tracker1,
+        suppress_nested=suppress_nested_detections,
+        nested_contain_thresh=nested_contain_thresh,
+        nested_area_ratio=nested_area_ratio
+    )
 
-    # Cross-view match initial detections
-    matched_12_1, matched_12_2 = match_detections(initial_detections1, initial_detections2, tracker1, tracker2, tracker1.cross_view_match_threshold, shared_id_manager)
-    matched_13_1, matched_13_3 = match_detections(initial_detections1, initial_detections3, tracker1, tracker3, tracker1.cross_view_match_threshold, shared_id_manager)
-    matched_23_2, matched_23_3 = match_detections(initial_detections2, initial_detections3, tracker2, tracker3, tracker2.cross_view_match_threshold, shared_id_manager)
+    initial_detections2 = detect_view(
+        frame2, frame_id, annotations2, size, mask2, det_model,
+        sahi_conf_threshold2, sahi_iou_threshold2, slice_h2, slice_w2,
+        slice_overlap2, pose_model, pose_attempts2, pose_conf_threshold2,
+        pose_iou_threshold2, tracker2,
+        suppress_nested=suppress_nested_detections,
+        nested_contain_thresh=nested_contain_thresh,
+        nested_area_ratio=nested_area_ratio
+    )
 
-    # Pose for initial
-    for d in initial_detections1:
-        kpts, vec = process_detection_pose(frame1, d['bbox'], pose_model, pose_attempts1, pose_conf_threshold1, pose_iou_threshold1)
-        d['keypoints'] = kpts
-        d['pose_vec'] = vec
-    for d in initial_detections2:
-        kpts, vec = process_detection_pose(frame2, d['bbox'], pose_model, pose_attempts2, pose_conf_threshold2, pose_iou_threshold2)
-        d['keypoints'] = kpts
-        d['pose_vec'] = vec
-    for d in initial_detections3:
-        kpts, vec = process_detection_pose(frame3, d['bbox'], pose_model, pose_attempts3, pose_conf_threshold3, pose_iou_threshold3)
-        d['keypoints'] = kpts
-        d['pose_vec'] = vec
+    # Update trackers with initial detections
+    tracks1, _, _ = tracker1.update(
+        initial_detections1, frame_id, finalize=True,
+        resolve_conflicts=(frame_id not in annotations1)
+    )
+    tracks2, _, _ = tracker2.update(
+        initial_detections2, frame_id, finalize=True,
+        resolve_conflicts=(frame_id not in annotations2)
+    )
+    # tracklet aggregation disabled
 
-    # Update trackers
-    tracks1, _, _ = tracker1.update(initial_detections1, frame_id, finalize=True)
-    tracks2, _, _ = tracker2.update(initial_detections2, frame_id, finalize=True)
-    tracks3, _, _ = tracker3.update(initial_detections3, frame_id, finalize=True)
+    # Associate tracks across views (View 1 as anchor)
+    associate_tracks_to_view1(
+        tracker1, tracker2, frame_id,
+        tracker1.cross_view_match_threshold,
+        app_weight=appearance_weight1, world_weight=world_dist_weight1,
+        max_world_dist=2000.0, world_dist_tolerance=world_dist_tolerance1,
+        reproj_max_px=reproj_max_px1, reproj_soft_margin=reproj_soft_margin1,
+        prev_assoc=prev_assoc_v2, sticky_bonus=0.10,
+        conflict_log=conflict_log, conflict_view_id=2,
+        view_id_other=2,
+        tracklet_min_frames=tracklet_min_frames,
+        tracklet_store=tracklet_store,
+        use_pose_triangulation=use_pose_triangulation,
+        pose_triangulation_max_reproj=pose_triangulation_max_reproj,
+        always_overwrite_gid=always_overwrite_gid,
+        align_estimator=align_estimator,
+        pixel_align=None,
+        pixel_dist_max=None,
+        pixel_dist_soft_margin=align_pixel_soft_margin,
+        line_sig_lines_anchor=common_lines_1,
+        line_sig_lines_other=common_lines_2,
+        line_sig_thresh=0.15,
+        line_sig_debug_frames=line_sig_debug_frames,
+        anchor_view_id=1,
+    )
+    associate_tracks_to_view1(
+        tracker2, tracker1, frame_id,
+        tracker2.cross_view_match_threshold,
+        app_weight=appearance_weight2, world_weight=world_dist_weight2,
+        max_world_dist=2000.0, world_dist_tolerance=world_dist_tolerance2,
+        reproj_max_px=reproj_max_px2, reproj_soft_margin=reproj_soft_margin2,
+        prev_assoc=prev_assoc_v1, sticky_bonus=0.10,
+        conflict_log=conflict_log, conflict_view_id=1,
+        view_id_other=1,
+        tracklet_min_frames=tracklet_min_frames,
+        tracklet_store=tracklet_store,
+        use_pose_triangulation=use_pose_triangulation,
+        pose_triangulation_max_reproj=pose_triangulation_max_reproj,
+        always_overwrite_gid=always_overwrite_gid,
+        align_estimator=align_estimator,
+        pixel_align=None,
+        pixel_dist_max=None,
+        pixel_dist_soft_margin=align_pixel_soft_margin,
+        line_sig_lines_anchor=common_lines_2,
+        line_sig_lines_other=common_lines_1,
+        line_sig_thresh=0.15,
+        line_sig_debug_frames=line_sig_debug_frames,
+        anchor_view_id=2
+    )
+    if conflict_writer and conflict_log:
+        for row in conflict_log:
+            conflict_writer.writerow(row)
+        conflict_log.clear()
 
     # Log initial events
     for event in tracker1.get_frame_events():
         event['view'] = 1
+        _augment_event_with_world_pos(event, tracker1)
         csv_writer1.writerow(event)
     for event in tracker2.get_frame_events():
         event['view'] = 2
+        _augment_event_with_world_pos(event, tracker2)
         csv_writer2.writerow(event)
-    for event in tracker3.get_frame_events():
-        event['view'] = 3
-        csv_writer3.writerow(event)
 
     # Save first frame
     roi1 = apply_trapezoid_mask(frame1, mask1)
     roi2 = apply_trapezoid_mask(frame2, mask2)
-    out1 = draw_tracks(roi1.copy(), tracks1, size, 12, connections, tracker1, 
-                       other_tracks=tracks2, other_view_name="V2")
-    out2 = draw_tracks(roi2.copy(), tracks2, size, 12, connections, tracker2, 
-                       other_tracks=tracks1, other_view_name="V1")
+    if draw_court_lines_debug:
+        roi1 = draw_court_lines(roi1, line_debug1, color=(0, 255, 0), thickness=2, label=True)
+        roi2 = draw_court_lines(roi2, line_debug2, color=(0, 255, 0), thickness=2, label=True)
+    out1 = draw_tracks(roi1.copy(), tracks1, None, connections, tracker1)
+    out2 = draw_tracks(roi2.copy(), tracks2, None, connections, tracker2)
     writer1.write(out1)
     writer2.write(out2)
-    if cap3:
-        roi3 = apply_trapezoid_mask(frame3, mask3)
-        out3 = draw_tracks(roi3.copy(), tracks3, size, 12, connections, tracker3, 
-                           other_tracks=None, other_view_name="")
-        writer3.write(out3)
-    if cap3:
-        roi3 = apply_trapezoid_mask(frame3, mask3)
-        out3 = draw_tracks(roi3.copy(), tracks3, size, 12, connections, tracker3, 
-                           other_tracks=None, other_view_name="")
-        writer3.write(out3)
+    
 
-    frame_id += 1  # Increment to next frame for the loop
+    frame_id += 1
 
-    def match_tracks(active_a, active_b, tracker_a, tracker_b, match_threshold):
-        if not active_a or not active_b:
-            return
-        cross_costs = np.zeros((len(active_a), len(active_b)), dtype=np.float32)
-        for i, ta in enumerate(active_a):
-            for j, tb in enumerate(active_b):
-                sim = tracker_a._cross_view_similarity(ta, tb)
-                cross_costs[i, j] = 1.0 - sim
-        row_ind, col_ind = linear_sum_assignment(cross_costs)
-        for r, c in zip(row_ind, col_ind):
-            if cross_costs[r, c] <= 1.0 - match_threshold:
-                ta, tb = active_a[r], active_b[c]
-                gid1, gid2 = ta['global_id'], tb['global_id']
-                if gid1 != gid2:
-                    # Merge using oldest ID
-                    if ta['start_frame'] <= tb['start_frame']:
-                        tracker_b.merge_global_ids(gid2, gid1, frame_id)
-                        # Update world_pos with triangulation
-                        p3d = IOUTracker.triangulate(tracker_a, tracker_b, ta['bbox'], tb['bbox'])
-                        if p3d is not None:
-                            if gid1 in tracker_a.global_id_to_track:
-                                tracker_a.global_id_to_track[gid1]['world_pos'] = p3d
-                            if gid1 in tracker_b.global_id_to_track:
-                                tracker_b.global_id_to_track[gid1]['world_pos'] = p3d
-                    else:
-                        tracker_a.merge_global_ids(gid1, gid2, frame_id)
-                        p3d = IOUTracker.triangulate(tracker_a, tracker_b, ta['bbox'], tb['bbox'])
-                        if p3d is not None:
-                            if gid2 in tracker_a.global_id_to_track:
-                                tracker_a.global_id_to_track[gid2]['world_pos'] = p3d
-                            if gid2 in tracker_b.global_id_to_track:
-                                tracker_b.global_id_to_track[gid2]['world_pos'] = p3d
-
-    # Main loop for subsequent frames
-    while cap1.isOpened() and cap2.isOpened() and (not cap3 or cap3.isOpened()):
+    # ===== MAIN PROCESSING LOOP =====
+    print("Starting main processing loop...")
+    
+    while cap1.isOpened() and cap2.isOpened():
         ok1, frame1 = cap1.read()
         ok2, frame2 = cap2.read()
-        ok3, frame3 = cap3.read() if cap3 else (False, None)
-        if not (ok1 and ok2) or (cap3 and not ok3):
+        
+        if not (ok1 and ok2):
             break
 
         frame1 = cv.resize(frame1, size)
         frame2 = cv.resize(frame2, size)
-        if frame3 is not None:
-            frame3 = cv.resize(frame3, size)
-
         start_time = time.time()
 
-        # --- Detection ---
-        # View 1
-        detections1 = []
-        if frame_id in annotations1:
-            # Use annotations for this frame
-            for anno_file in annotations1[frame_id]:
-                detections1.extend(parse_yolo_annotations(
-                    anno_file, size[0], size[1], frame1, pose_model, pose_attempts1, pose_conf_threshold1, pose_iou_threshold1, tracker=tracker1
-                ))
-        else:
-            # Use YOLO detection
-            roi1 = apply_trapezoid_mask(frame1, mask1)
-            mask_1d = np.any(roi1 > 0, axis=2)
-            if np.any(mask_1d):
-                coords = np.where(mask_1d)
-                min_y1, max_y1 = coords[0].min(), coords[0].max()
-                min_x1, max_x1 = coords[1].min(), coords[1].max()
-                cropped1 = roi1[min_y1:max_y1 + 1, min_x1:max_x1 + 1]
+        # ===== STEP 1: DETECTION + POSE =====
+        detections1 = detect_view(
+            frame1, frame_id, annotations1, size, mask1, det_model,
+            sahi_conf_threshold1, sahi_iou_threshold1, slice_h1, slice_w1,
+            slice_overlap1, pose_model, pose_attempts1, pose_conf_threshold1,
+            pose_iou_threshold1, tracker1,
+            suppress_nested=suppress_nested_detections,
+            nested_contain_thresh=nested_contain_thresh,
+            nested_area_ratio=nested_area_ratio
+        )
+        detections2 = detect_view(
+            frame2, frame_id, annotations2, size, mask2, det_model,
+            sahi_conf_threshold2, sahi_iou_threshold2, slice_h2, slice_w2,
+            slice_overlap2, pose_model, pose_attempts2, pose_conf_threshold2,
+            pose_iou_threshold2, tracker2,
+            suppress_nested=suppress_nested_detections,
+            nested_contain_thresh=nested_contain_thresh,
+            nested_area_ratio=nested_area_ratio
+        )
+        # ===== STEP 4: UPDATE TRACKERS (finalize=True) =====
+        tracks1, _, _ = tracker1.update(
+            detections1, frame_id, finalize=True,
+            resolve_conflicts=(frame_id not in annotations1)
+        )
+        tracks2, _, _ = tracker2.update(
+            detections2, frame_id, finalize=True,
+            resolve_conflicts=(frame_id not in annotations2)
+        )
+        # tracklet aggregation disabled
 
-                preds1 = get_sliced_prediction(
-                    cropped1, det_model, slice_height=slice_h1, slice_width=slice_w1,
-                    overlap_height_ratio=slice_overlap1, overlap_width_ratio=slice_overlap1,
-                    postprocess_match_metric='IOU', postprocess_match_threshold=sahi_iou_threshold1, verbose=0
-                )
+        # ===== STEP 5: CROSS-VIEW ASSOCIATION (VIEW 1 AS ANCHOR) =====
+        associate_tracks_to_view1(
+            tracker1, tracker2, frame_id,
+            tracker1.cross_view_match_threshold,
+            app_weight=appearance_weight1, world_weight=world_dist_weight1,
+            max_world_dist=2000.0, world_dist_tolerance=world_dist_tolerance1,
+            reproj_max_px=reproj_max_px1, reproj_soft_margin=reproj_soft_margin1,
+            prev_assoc=prev_assoc_v2, sticky_bonus=0.10,
+            conflict_log=conflict_log, conflict_view_id=2,
+            view_id_other=2,
+            tracklet_min_frames=tracklet_min_frames,
+            tracklet_store=tracklet_store,
+            use_pose_triangulation=use_pose_triangulation,
+            pose_triangulation_max_reproj=pose_triangulation_max_reproj,
+            always_overwrite_gid=always_overwrite_gid,
+            align_estimator=align_estimator,
+            pixel_align=None,
+            pixel_dist_max=None,
+            pixel_dist_soft_margin=align_pixel_soft_margin,
+            line_sig_lines_anchor=common_lines_1,
+            line_sig_lines_other=common_lines_2,
+            line_sig_thresh=0.15,
+            line_sig_debug_frames=line_sig_debug_frames,
+            anchor_view_id=1
+        )
+        associate_tracks_to_view1(
+            tracker2, tracker1, frame_id,
+            tracker2.cross_view_match_threshold,
+            app_weight=appearance_weight2, world_weight=world_dist_weight2,
+            max_world_dist=2000.0, world_dist_tolerance=world_dist_tolerance2,
+            reproj_max_px=reproj_max_px2, reproj_soft_margin=reproj_soft_margin2,
+            prev_assoc=prev_assoc_v1, sticky_bonus=0.10,
+            conflict_log=conflict_log, conflict_view_id=1,
+            view_id_other=1,
+            tracklet_min_frames=tracklet_min_frames,
+            tracklet_store=tracklet_store,
+            use_pose_triangulation=use_pose_triangulation,
+            pose_triangulation_max_reproj=pose_triangulation_max_reproj,
+            always_overwrite_gid=always_overwrite_gid,
+            align_estimator=align_estimator,
+            pixel_align=None,
+            pixel_dist_max=None,
+            pixel_dist_soft_margin=align_pixel_soft_margin,
+            line_sig_lines_anchor=common_lines_2,
+            line_sig_lines_other=common_lines_1,
+            line_sig_thresh=0.15,
+            line_sig_debug_frames=line_sig_debug_frames,
+            anchor_view_id=2
+        )
+        if conflict_writer and conflict_log:
+            for row in conflict_log:
+                conflict_writer.writerow(row)
+            conflict_log.clear()
 
-                if preds1 and preds1.object_prediction_list:
-                    for p in preds1.object_prediction_list:
-                        if p.category.id == 0 and p.score.value >= sahi_conf_threshold1:
-                            bx1, by1, bx2, by2 = map(int, p.bbox.to_xyxy())
-                            bbox = (bx1 + min_x1, by1 + min_y1, bx2 + min_x1, by2 + min_y1)
-                            appearance = compute_team_appearence(frame1, bbox)
-                            world_pos = tracker1.project_to_world(bbox)
-                            detections1.append({
-                                'bbox': bbox, 'appearance': appearance, 'world_pos': world_pos, 'score': p.score.value
-                            })
-
-        # View 2
-        detections2 = []
-        if frame_id in annotations2:
-            # Use annotations for this frame
-            for anno_file in annotations2[frame_id]:
-                detections2.extend(parse_yolo_annotations(
-                    anno_file, size[0], size[1], frame2, pose_model, pose_attempts2, pose_conf_threshold2, pose_iou_threshold2, tracker=tracker2
-                ))
-        else:
-            # Use YOLO detection
-            roi2 = apply_trapezoid_mask(frame2, mask2)
-            mask_2d = np.any(roi2 > 0, axis=2)
-            if np.any(mask_2d):
-                coords = np.where(mask_2d)
-                min_y2, max_y2 = coords[0].min(), coords[0].max()
-                min_x2, max_x2 = coords[1].min(), coords[1].max()
-                cropped2 = roi2[min_y2:max_y2 + 1, min_x2:max_x2 + 1]
-
-                preds2 = get_sliced_prediction(
-                    cropped2, det_model, slice_height=slice_h2, slice_width=slice_w2,
-                    overlap_height_ratio=slice_overlap2, overlap_width_ratio=slice_overlap2,
-                    postprocess_match_metric='IOU', postprocess_match_threshold=sahi_iou_threshold2, verbose=0
-                )
-
-                if preds2 and preds2.object_prediction_list:
-                    for p in preds2.object_prediction_list:
-                        if p.category.id == 0 and p.score.value >= sahi_conf_threshold2:
-                            bx1, by1, bx2, by2 = map(int, p.bbox.to_xyxy())
-                            bbox = (bx1 + min_x2, by1 + min_y2, bx2 + min_x2, by2 + min_y2)
-                            appearance = compute_team_appearence(frame2, bbox)
-                            world_pos = tracker2.project_to_world(bbox)
-                            detections2.append({
-                                'bbox': bbox, 'appearance': appearance, 'world_pos': world_pos, 'score': p.score.value
-                            })
-
-        # View 3
-        detections3 = []
-        if annotations_dir3 and frame_id in annotations3:
-            # Use annotations for this frame
-            for anno_file in annotations3[frame_id]:
-                detections3.extend(parse_yolo_annotations(
-                    anno_file, size[0], size[1], frame3, pose_model, pose_attempts3, pose_conf_threshold3, pose_iou_threshold3, tracker=tracker3
-                ))
-        elif frame3 is not None:
-            # Use YOLO detection
-            roi3 = apply_trapezoid_mask(frame3, mask3)
-            mask_3d = np.any(roi3 > 0, axis=2)
-            if np.any(mask_3d):
-                coords = np.where(mask_3d)
-                min_y3, max_y3 = coords[0].min(), coords[0].max()
-                min_x3, max_x3 = coords[1].min(), coords[1].max()
-                cropped3 = roi3[min_y3:max_y3 + 1, min_x3:max_x3 + 1]
-
-                preds3 = get_sliced_prediction(
-                    cropped3, det_model, slice_height=slice_h3, slice_width=slice_w3,
-                    overlap_height_ratio=slice_overlap3, overlap_width_ratio=slice_overlap3,
-                    postprocess_match_metric='IOU', postprocess_match_threshold=sahi_iou_threshold3, verbose=0
-                )
-
-                if preds3 and preds3.object_prediction_list:
-                    for p in preds3.object_prediction_list:
-                        if p.category.id == 0 and p.score.value >= sahi_conf_threshold3:
-                            bx1, by1, bx2, by2 = map(int, p.bbox.to_xyxy())
-                            bbox = (bx1 + min_x3, by1 + min_y3, bx2 + min_x3, by2 + min_y3)
-                            appearance = compute_team_appearence(frame3, bbox)
-                            world_pos = tracker3.project_to_world(bbox)
-                            detections3.append({
-                                'bbox': bbox, 'appearance': appearance, 'world_pos': world_pos, 'score': p.score.value
-                            })
-
-        # --- Determine 3D positions using all views ---
-        # Cross-view match detections for all pairs
-        matched_12_1, matched_12_2 = match_detections(detections1, detections2, tracker1, tracker2, tracker1.cross_view_match_threshold, shared_id_manager)
-        matched_13_1, matched_13_3 = match_detections(detections1, detections3, tracker1, tracker3, tracker1.cross_view_match_threshold, shared_id_manager)
-        matched_23_2, matched_23_3 = match_detections(detections2, detections3, tracker2, tracker3, tracker2.cross_view_match_threshold, shared_id_manager)
-
-        # For unmatched detections, assign global_id to allow single-view tracking
-        for d in detections1:
-            if 'global_id' not in d:
-                d['global_id'] = shared_id_manager.next_id()
-        for d in detections2:
-            if 'global_id' not in d:
-                d['global_id'] = shared_id_manager.next_id()
-        for d in detections3:
-            if 'global_id' not in d:
-                d['global_id'] = shared_id_manager.next_id()
-
-        # --- If detected only in one view, deduce in the other views ---
-        # For detections in view1 not matched in any pair, deduce in view2 and view3
-        for i, d1 in enumerate(detections1):
-            if i not in matched_12_1 and i not in matched_13_1 and 'global_id' in d1:
-                gid = d1['global_id']
-                if detections2:
-                    tracker2.deduce_track_position(gid, d1['world_pos'], frame_id, frame_shape=(size[1], size[0]), mask=mask2)
-                if detections3:
-                    tracker3.deduce_track_position(gid, d1['world_pos'], frame_id, frame_shape=(size[1], size[0]), mask=mask3)
-        # For detections in view2 not matched in any pair, deduce in view1 and view3
-        for j, d2 in enumerate(detections2):
-            if j not in matched_12_2 and j not in matched_23_2 and 'global_id' in d2:
-                gid = d2['global_id']
-                if detections1:
-                    tracker1.deduce_track_position(gid, d2['world_pos'], frame_id, frame_shape=(size[1], size[0]), mask=mask1)
-                if detections3:
-                    tracker3.deduce_track_position(gid, d2['world_pos'], frame_id, frame_shape=(size[1], size[0]), mask=mask3)
-        # For detections in view3 not matched in any pair, deduce in view1 and view2
-        for k, d3 in enumerate(detections3):
-            if k not in matched_13_3 and k not in matched_23_3 and 'global_id' in d3:
-                gid = d3['global_id']
-                if detections1:
-                    tracker1.deduce_track_position(gid, d3['world_pos'], frame_id, frame_shape=(size[1], size[0]), mask=mask1)
-                if detections2:
-                    tracker2.deduce_track_position(gid, d3['world_pos'], frame_id, frame_shape=(size[1], size[0]), mask=mask2)
-
-        # --- Pose estimation ---
-        for d in detections1:
-            kpts, vec = process_detection_pose(frame1, d['bbox'], pose_model, pose_attempts1, pose_conf_threshold1, pose_iou_threshold1)
-            d['keypoints'] = kpts
-            d['pose_vec'] = vec
-        for d in detections2:
-            kpts, vec = process_detection_pose(frame2, d['bbox'], pose_model, pose_attempts2, pose_conf_threshold2, pose_iou_threshold2)
-            d['keypoints'] = kpts
-            d['pose_vec'] = vec
-        for d in detections3:
-            kpts, vec = process_detection_pose(frame3, d['bbox'], pose_model, pose_attempts3, pose_conf_threshold3, pose_iou_threshold3)
-            d['keypoints'] = kpts
-            d['pose_vec'] = vec
-
-        # --- Update tracker ---
-        tracks1, _, _ = tracker1.update(detections1, frame_id, finalize=True)
-        tracks2, _, _ = tracker2.update(detections2, frame_id, finalize=True)
-        tracks3, _, _ = tracker3.update(detections3, frame_id, finalize=True)
-
-        # --- Cross-view matching of tracks to merge IDs ---
-        active1 = [t for t in tracks1 if t['updated']]
-        active2 = [t for t in tracks2 if t['updated']]
-        active3 = [t for t in tracks3 if t['updated']]
-        match_tracks(active1, active2, tracker1, tracker2, tracker1.cross_view_match_threshold)
-        match_tracks(active1, active3, tracker1, tracker3, tracker1.cross_view_match_threshold)
-        match_tracks(active2, active3, tracker2, tracker3, tracker2.cross_view_match_threshold)
-
-        # --- Re-entry matching for lost tracks ---
-        lost1 = [t for t in tracks1 if t['missed'] > 0 and not t['updated']]
-        lost2 = [t for t in tracks2 if t['missed'] > 0 and not t['updated']]
-        lost3 = [t for t in tracks3 if t['missed'] > 0 and not t['updated']]
-        new1 = [t for t in tracks1 if t['start_frame'] == frame_id]
-        new2 = [t for t in tracks2 if t['start_frame'] == frame_id]
-        new3 = [t for t in tracks3 if t['start_frame'] == frame_id]
-
-        # Match new tracks in view 1 to lost tracks in view 2 and view 3
-        for nt in new1:
-            if nt.get('world_pos') is None: continue
-            min_dist = float('inf')
-            closest_lost = None
-            for lt in lost2 + lost3:
-                if lt.get('world_pos') is None: continue
-                if len(nt['world_pos']) != 3 or len(lt['world_pos']) != 3: continue
-                dist = np.linalg.norm(np.array(nt['world_pos']) - np.array(lt['world_pos']))
-                if dist < min_dist:
-                    min_dist = dist
-                    closest_lost = lt
-            if closest_lost and min_dist < re_entry_proximity_threshold:
-                tracker1.merge_global_ids(nt['global_id'], closest_lost['global_id'], frame_id)
-
-        # Match new tracks in view 2 to lost tracks in view 1 and view 3
-        for nt in new2:
-            if nt.get('world_pos') is None: continue
-            min_dist = float('inf')
-            closest_lost = None
-            for lt in lost1 + lost3:
-                if lt.get('world_pos') is None: continue
-                if len(nt['world_pos']) != 3 or len(lt['world_pos']) != 3: continue
-                dist = np.linalg.norm(np.array(nt['world_pos']) - np.array(lt['world_pos']))
-                if dist < min_dist:
-                    min_dist = dist
-                    closest_lost = lt
-            if closest_lost and min_dist < re_entry_proximity_threshold:
-                tracker2.merge_global_ids(nt['global_id'], closest_lost['global_id'], frame_id)
-
-        # Match new tracks in view 3 to lost tracks in view 1 and view 2
-        for nt in new3:
-            if nt.get('world_pos') is None: continue
-            min_dist = float('inf')
-            closest_lost = None
-            for lt in lost1 + lost2:
-                if lt.get('world_pos') is None: continue
-                if len(nt['world_pos']) != 3 or len(lt['world_pos']) != 3: continue
-                dist = np.linalg.norm(np.array(nt['world_pos']) - np.array(lt['world_pos']))
-                if dist < min_dist:
-                    min_dist = dist
-                    closest_lost = lt
-            if closest_lost and min_dist < re_entry_proximity_threshold:
-                tracker3.merge_global_ids(nt['global_id'], closest_lost['global_id'], frame_id)
-
-        # Log all events for this frame to CSV
+        # ===== LOG EVENTS =====
         for event in tracker1.get_frame_events():
-            if 'view' not in event: event['view'] = 1
+            if 'view' not in event:
+                event['view'] = 1
+            _augment_event_with_world_pos(event, tracker1)
             csv_writer1.writerow(event)
+        
         for event in tracker2.get_frame_events():
-            if 'view' not in event: event['view'] = 2
+            if 'view' not in event:
+                event['view'] = 2
+            _augment_event_with_world_pos(event, tracker2)
             csv_writer2.writerow(event)
-        for event in tracker3.get_frame_events():
-            if 'view' not in event: event['view'] = 3
-            csv_writer3.writerow(event)
 
-        # Refresh tracks after cross-view matching and deduction
+        # Refresh tracks after all operations
         tracks1 = tracker1.tracks
         tracks2 = tracker2.tracks
-        tracks3 = tracker3.tracks
 
-        # --- Drawing and Display ---
+        # ===== DRAWING =====
         roi1 = apply_trapezoid_mask(frame1, mask1)
         roi2 = apply_trapezoid_mask(frame2, mask2)
-        roi3 = apply_trapezoid_mask(frame3, mask3) if frame3 is not None else None
-
-        out1 = draw_tracks(roi1.copy(), tracks1, size, 12, connections, tracker1, 
-                           other_tracks=tracks2, other_view_name="V2")
-        out2 = draw_tracks(roi2.copy(), tracks2, size, 12, connections, tracker2, 
-                           other_tracks=tracks1, other_view_name="V1")
-        out3 = draw_tracks(roi3.copy(), tracks3, size, 12, connections, tracker3, 
-                           other_tracks=None, other_view_name="") if roi3 is not None else None
+        if draw_court_lines_debug:
+            roi1 = draw_court_lines(roi1, line_debug1, color=(0, 255, 0), thickness=2, label=True)
+            roi2 = draw_court_lines(roi2, line_debug2, color=(0, 255, 0), thickness=2, label=True)
+        out1 = draw_tracks(roi1.copy(), tracks1, None, connections, tracker1)
+        out2 = draw_tracks(roi2.copy(), tracks2, None, connections, tracker2)
 
         dt = time.time() - start_time
         fps_hist.append(1 / dt if dt > 0 else 0)
         fps_avg = sum(fps_hist) / len(fps_hist) if fps_hist else 0
+        
         draw_text_with_bg(out1, f'FPS {int(fps_avg)}', (30, 50))
         draw_text_with_bg(out1, f'Frame {frame_id}', (30, 100))
         draw_text_with_bg(out2, f'FPS {int(fps_avg)}', (30, 50))
         draw_text_with_bg(out2, f'Frame {frame_id}', (30, 100))
-        if out3 is not None:
-            draw_text_with_bg(out3, f'FPS {int(fps_avg)}', (30, 50))
-            draw_text_with_bg(out3, f'Frame {frame_id}', (30, 100))
 
         writer1.write(out1)
-        writer2.write(out2) # write output for view 2
-        if out3 is not None:
-            writer3.write(out3)
+        writer2.write(out2)
 
-        # Display both views in separate windows
         cv.imshow('Tracking View 1', out1)
         cv.imshow('Tracking View 2', out2)
-        if out3 is not None:
-            cv.imshow('Tracking View 3', out3)
+        
         if cv.waitKey(1) & 0xFF == ord('q'):
             break
 
         frame_id += 1
 
+    # Cleanup
     cap1.release()
     cap2.release()
-    if cap3: cap3.release()
+    
     writer1.release()
     writer2.release()
-    writer3.release()
+    
     cv.destroyAllWindows()
 
-    csv_file1.close() # Close csv_file1
-    csv_file2.close() # Close csv_file2
-    if csv_file3: csv_file3.close()
+    csv_file1.close()
+    csv_file2.close()
+    if conflict_file:
+        conflict_file.close()
+
+    print("Processing complete!")
 
 
 if __name__ == '__main__':
     try:
         yolo_sahi_pose_tracking(
-            source1='Tracking/material4project/Rectified videos/tracking_12/out4.mp4',
-            source2='Tracking/material4project/Rectified videos/tracking_12/out13.mp4',
-            source3='Tracking/material4project/Rectified videos/tracking_12/out2.mp4',
-            calib_path1='Tracking/material4project/3D Tracking Material/camera_data_with_Rvecs/camera_data/cam_4/calib/camera_calib.json',
-            calib_path2='Tracking/material4project/3D Tracking Material/camera_data_with_Rvecs/camera_data/cam_13/calib/camera_calib.json',
-            calib_path3='Tracking/material4project/3D Tracking Material/camera_data_with_Rvecs/camera_data/cam_2/calib/camera_calib.json',
+            source1='Tracking/material4project/Rectified videos/tracking_12/out13.mp4',
+            source2='Tracking/material4project/Rectified videos/tracking_12/out4.mp4',
+            calib_path1='Tracking/material4project/3D Tracking Material/camera_data_with_Rvecs/camera_data/cam_13/calib/camera_calib_real.json',
+            calib_path2='Tracking/material4project/3D Tracking Material/camera_data_with_Rvecs/camera_data/cam_4/calib/camera_calib_real.json',
             annotations_dir1='tracking_12.v4i.yolov11/train/labels/',
             annotations_dir2='tracking_12.v4i.yolov11/train/labels/',
-            output_path1='output_view1.mp4',
-            output_path2='output_view2.mp4',
-            output_path3='output_view3.mp4',
+            output_path1='output_view1_improved.mp4',
+            output_path2='output_view2_improved.mp4',
             start_frame=1,
-            enable_pose=False,
+            enable_pose=True,
+            court_lines_path1='court_lines_cam13.json',
+            court_lines_path2='court_lines_cam4.json',
+            court_corners_path1='cam13_img_corners_rectified.json',
+            court_corners_path2='cam4_img_corners_rectified.json',
+            court_line_correspondence_path='court_line_corrispondency.json',
+            court_line_view1_key='line_id_cam13',
+            court_line_view2_key='line_id_cam4',
+            draw_court_lines_debug=True,
         )
     except Exception as e:
         print(f"Error during execution: {e}")
