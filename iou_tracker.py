@@ -44,7 +44,6 @@ class IOUTracker:
     """
     def __init__(self,
                  match_threshold=0.35,
-                 cross_view_match_threshold=0.4,
                  max_missed_frames=10,
                  iou_weight=0.5,
                  appearance_weight=0.35,
@@ -81,7 +80,6 @@ class IOUTracker:
             is_rectified (bool): Whether input videos are already rectified (no distortion).
         """
         self.match_threshold = match_threshold
-        self.cross_view_match_threshold = cross_view_match_threshold
         self.max_missed = max_missed_frames
         self.iou_w = iou_weight
         self.app_w = appearance_weight
@@ -228,16 +226,6 @@ class IOUTracker:
         world_point /= world_point[2]  # Normalize
         
         # FIX: Return 3D point with Z=0 for consistency
-        return np.array([world_point[0, 0], world_point[1, 0], 0.0], dtype=np.float32)
-
-    def project_pixel_to_world(self, px, py):
-        """Project a single pixel point (x, y) to the ground plane (Z=0)."""
-        if not hasattr(self, 'H_inv'):
-            return None
-        H_inv = self.H_inv_dynamic if self.H_inv_dynamic is not None else self.H_inv
-        pixel_point = np.array([px, py, 1.0], dtype=np.float32).reshape(3, 1)
-        world_point = H_inv @ pixel_point
-        world_point /= world_point[2]
         return np.array([world_point[0, 0], world_point[1, 0], 0.0], dtype=np.float32)
 
     def set_dynamic_hinv(self, H_inv):
@@ -459,33 +447,91 @@ class IOUTracker:
         self.next_id += 1
         return new_track
 
+    def _find_track_by_gid(self, gid, exclude_track=None):
+        if gid is None:
+            return None
+        t = self.global_id_to_track.get(gid)
+        if t is not None and t is not exclude_track and t in self.tracks:
+            return t
+        for cand in self.tracks:
+            if cand is exclude_track:
+                continue
+            if cand.get('global_id') == gid:
+                return cand
+        return None
+
+    def reassign_track_global_id(self, track, new_gid, frame_id, allow_target_conflict=False):
+        """
+        Reassign a specific track to a new global ID.
+        If allow_target_conflict is False, reassignment is refused when new_gid
+        is already occupied by a different track in this view.
+        """
+        if track is None or new_gid is None:
+            return False
+
+        old_gid = track.get('global_id')
+        tid = track.get('track_id')
+
+        if old_gid == new_gid:
+            if tid is not None:
+                self.track_to_global_id[tid] = new_gid
+            self.global_id_to_track[new_gid] = track
+            return True
+
+        occupied = self._find_track_by_gid(new_gid, exclude_track=track)
+        if occupied is not None and not allow_target_conflict:
+            return False
+
+        # Optional controlled swap path (currently not used by caller).
+        if occupied is not None and allow_target_conflict:
+            occupied_old_gid = occupied.get('global_id')
+            fallback_gid = old_gid
+            if fallback_gid is None or self._find_track_by_gid(fallback_gid, exclude_track=occupied) is not None:
+                fallback_gid = self.id_manager.next_id()
+
+            if occupied_old_gid in self.global_id_to_track and self.global_id_to_track[occupied_old_gid] is occupied:
+                del self.global_id_to_track[occupied_old_gid]
+            occupied['global_id'] = fallback_gid
+            self.track_to_global_id[occupied['track_id']] = fallback_gid
+            self.global_id_to_track[fallback_gid] = occupied
+            self.current_frame_events.append({
+                'frame': frame_id,
+                'track_id': occupied['track_id'],
+                'event': 'gid_conflict_resolved',
+                'old_global_id': occupied_old_gid,
+                'new_global_id': fallback_gid
+            })
+
+        if old_gid in self.global_id_to_track and self.global_id_to_track[old_gid] is track:
+            del self.global_id_to_track[old_gid]
+
+        track['global_id'] = new_gid
+        if tid is not None:
+            self.track_to_global_id[tid] = new_gid
+        self.global_id_to_track[new_gid] = track
+
+        self.current_frame_events.append({
+            'frame': frame_id,
+            'track_id': tid,
+            'event': 'merged_id',
+            'old_global_id': old_gid,
+            'new_global_id': new_gid
+        })
+        return True
+
     def merge_global_ids(self, old_gid, new_gid, frame_id):
         """
         Merges two global IDs. All references to old_gid will be updated to new_gid.
         """
         if old_gid == new_gid:
-            return
-        
-        if old_gid in self.global_id_to_track:
-            track = self.global_id_to_track[old_gid]
-            # Remove old mapping
-            del self.global_id_to_track[old_gid]
-            # Update track object
-            track['global_id'] = new_gid
-            if track.get('gid_source') is None:
-                track['gid_source'] = None
-            # Add new mapping
-            self.global_id_to_track[new_gid] = track
-            # Update track_to_global_id mapping
-            self.track_to_global_id[track['track_id']] = new_gid
-            
-            self.current_frame_events.append({
-                'frame': frame_id,
-                'track_id': track['track_id'],
-                'event': 'merged_id',
-                'old_global_id': old_gid,
-                'new_global_id': new_gid
-            })
+            return True
+
+        track = self._find_track_by_gid(old_gid)
+        if track is None:
+            return False
+        return self.reassign_track_global_id(
+            track, new_gid, frame_id, allow_target_conflict=False
+        )
 
     def resolve_gid_conflicts(self, frame_id):
         """
@@ -548,7 +594,9 @@ class IOUTracker:
 
         if det.get('gid_source') == 'annotation' and det.get('global_id') is not None:
             if det['global_id'] != track['global_id']:
-                self.merge_global_ids(track['global_id'], det['global_id'], frame_id)
+                self.reassign_track_global_id(
+                    track, det['global_id'], frame_id, allow_target_conflict=False
+                )
 
         track['bbox'] = det['bbox']
         track['keypoints'] = det.get('keypoints')

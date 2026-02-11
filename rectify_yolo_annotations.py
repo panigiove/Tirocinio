@@ -53,25 +53,32 @@ def find_calibration_for_cam(cam_index):
     Tries multiple paths similar to rectified_videos.py
     """
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    PROJECT_ROOT = os.path.join(BASE_DIR, "Tracking", "material4project")
+    MATERIAL_DIR = os.path.join(BASE_DIR, "Tracking", "material4project", "3D Tracking Material")
     
     candidates = [
-        os.path.join(PROJECT_ROOT, "3D Tracking Material", "camera_data", f"cam_{cam_index}", "calib", "camera_calib.json"),
-        os.path.join(PROJECT_ROOT, "3D Tracking Material", "camera_data", f"cam_{cam_index}", "camera_calib.json"),
-        os.path.join(PROJECT_ROOT, "camera_data", f"cam_{cam_index}", "calib", "camera_calib.json"),
-        os.path.join(PROJECT_ROOT, "camera_data", f"cam_{cam_index}", "camera_calib.json"),
+        # Current layout used by rectified_videos.py
+        os.path.join(
+            MATERIAL_DIR,
+            "camera_data_with_Rvecs_2ndversion",
+            f"cam_{cam_index}",
+            "calib",
+            "camera_calib.json",
+        ),
+        # Older dataset fallbacks
+        os.path.join(MATERIAL_DIR, "camera_data", f"cam_{cam_index}", "calib", "camera_calib.json"),
+        os.path.join(MATERIAL_DIR, "camera_data", f"cam_{cam_index}", "camera_calib.json"),
     ]
     for c in candidates:
         if os.path.exists(c):
             return c
 
     # fallback: recursive search
-    pattern = os.path.join(PROJECT_ROOT, "**", f"cam_{cam_index}", "calib", "camera_calib.json")
+    pattern = os.path.join(MATERIAL_DIR, "**", f"cam_{cam_index}", "calib", "camera_calib.json")
     found = glob.glob(pattern, recursive=True)
     if found:
         return found[0]
 
-    pattern2 = os.path.join(PROJECT_ROOT, "**", f"cam_{cam_index}", "*camera_calib.json")
+    pattern2 = os.path.join(MATERIAL_DIR, "**", f"cam_{cam_index}", "*camera_calib.json")
     found2 = glob.glob(pattern2, recursive=True)
     if found2:
         return found2[0]
@@ -160,9 +167,9 @@ def rectify_yolo_annotation_file(annotation_path, calib_path, original_img_width
         mtx[1, 2] *= sh
         print(f"  Note: Scaled camera matrix for {original_img_width}x{original_img_height}")
 
-    # Match rectified_videos.py: newCameraMatrix with alpha=0.25
+    # Match rectified_videos.py: newCameraMatrix with alpha=0
     newcameramtx, _ = cv2.getOptimalNewCameraMatrix(
-        mtx, dist, (original_img_width, original_img_height), 0.25, (original_img_width, original_img_height)
+        mtx, dist, (original_img_width, original_img_height), 0, (original_img_width, original_img_height)
     )
 
     # Read annotations

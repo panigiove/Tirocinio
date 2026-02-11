@@ -41,7 +41,7 @@ def process_video(video_path, calib_path, output_path):
             break
         
         h, w = frame.shape[:2]
-        newcameramtx, roi = cv2.getOptimalNewCameraMatrix(mtx, dist, (w, h), 0.25, (w, h))
+        newcameramtx, roi = cv2.getOptimalNewCameraMatrix(mtx, dist, (w, h), 0, (w, h))
         undistorted_frame = cv2.undistort(frame, mtx, dist, None, newcameramtx)
         out.write(undistorted_frame)
         frame_count += 1
@@ -70,7 +70,7 @@ def main():
         if match:
             cam_index = match.group(1)
             
-            calib_path = os.path.join(script_dir, "camera_data", f"cam_{cam_index}", "calib", "camera_calib.json")
+            calib_path = os.path.join(script_dir, "camera_data_with_Rvecs_2ndversion", f"cam_{cam_index}", "calib", "camera_calib.json")
         else:
             print("Could not extract camera index from filename:", video_path)
             continue

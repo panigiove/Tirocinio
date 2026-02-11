@@ -9,17 +9,19 @@ import numpy as np
 INPUT_DIR = Path(r"tracking_12.v4i.yolov11/train/images")
 OUTPUT_DIR = Path(r"tracking_12.v4i.yolov11/train/images_rectified")
 
-CALIB_PATHS = {
-    "out13": Path(
-        r"Tracking/material4project/3D Tracking Material/camera_data/cam_13/calib/camera_calib.json"
-    ),
-    "out4": Path(
-        r"Tracking/material4project/3D Tracking Material/camera_data/cam_4/calib/camera_calib.json"
-    ),
+CALIB_CAM_INDEX = {
+    "out13": "13",
+    "out4": "4",
 }
 
 # File glob for images
 IMAGE_GLOB = "*.jpg"
+
+
+def resolve_calibration_path(cam_index: str) -> Path:
+    """Resolve calibration path used by rectified_videos.py."""
+    base = Path(r"Tracking/material4project/3D Tracking Material/camera_data_with_Rvecs_2ndversion")
+    return base / f"cam_{cam_index}" / "calib" / "camera_calib.json"
 
 
 def load_calibration(calib_path: Path) -> tuple[np.ndarray, np.ndarray]:
@@ -44,7 +46,12 @@ def _pick_cam_key(name: str) -> str | None:
 def main() -> None:
     if not INPUT_DIR.exists():
         raise FileNotFoundError(f"Input dir not found: {INPUT_DIR}")
-    for key, path in CALIB_PATHS.items():
+
+    calib_paths = {
+        key: resolve_calibration_path(cam_index)
+        for key, cam_index in CALIB_CAM_INDEX.items()
+    }
+    for key, path in calib_paths.items():
         if not path.exists():
             raise FileNotFoundError(f"Calibration file not found for {key}: {path}")
 
@@ -68,13 +75,13 @@ def main() -> None:
 
         height, width = img.shape[:2]
         
-        mtx, dist = load_calibration(CALIB_PATHS[cam_key])
+        mtx, dist = load_calibration(calib_paths[cam_key])
         
         grid_x, grid_y = np.meshgrid(np.arange(width), np.arange(height))
         pts = np.stack([grid_x, grid_y], axis=-1).astype(np.float32)
         pts = pts.reshape(-1, 1, 2)
 
-        newcameramtx, roi = cv2.getOptimalNewCameraMatrix(mtx, dist, (width, height), 0.25, (width, height))
+        newcameramtx, roi = cv2.getOptimalNewCameraMatrix(mtx, dist, (width, height), 0, (width, height))
         rectified = cv2.undistort(img, mtx, dist, None, newcameramtx)
         out_path = rectified_output_path(img_path, OUTPUT_DIR)
         cv2.imwrite(str(out_path), rectified)

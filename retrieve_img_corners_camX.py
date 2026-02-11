@@ -4,10 +4,15 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+
+def resolve_img_points_path(cam_index: str) -> Path:
+    base = Path(r"Tracking/material4project/3D Tracking Material/camera_data_with_Rvecs_2ndversion")
+    return base / f"cam_{cam_index}" / "calib" / "img_points.json"
+
+
+CAM_INDEX = "13"
 VIDEO_PATH = Path(r"Tracking/material4project/video/tracking_12/out13.mp4")
-JSON_PATH = Path(
-    r"Tracking/material4project/3D Tracking Material/camera_data_with_Rvecs/camera_data/cam_13/calib/img_points.json"
-)
+JSON_PATH = resolve_img_points_path(CAM_INDEX)
 
 # If you only want a single frame overlay, set FRAME_INDEX to a non-negative index.
 # Set to None to process the entire video.

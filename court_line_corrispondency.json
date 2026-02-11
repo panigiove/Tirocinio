@@ -14,23 +14,23 @@
         },
         {
             "line_id_cam4": 3,
-            "line_id_cam13": 3
+            "line_id_cam13": 6
+        },
+        {
+            "line_id_cam4": 4,
+            "line_id_cam13": 7
         },
         {
             "line_id_cam4": 5,
-            "line_id_cam13": 16
+            "line_id_cam13": 8
         },
         {
             "line_id_cam4": 6,
-            "line_id_cam13": 17
+            "line_id_cam13": 16
         },
         {
             "line_id_cam4": 7,
-            "line_id_cam13": 18
-        },
-        {
-            "line_id_cam4": 8,
-            "line_id_cam13": 27
+            "line_id_cam13": 17
         }
     ]
 }

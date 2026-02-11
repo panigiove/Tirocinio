@@ -15,45 +15,10 @@ import re
 from iou_tracker import IOUTracker, GlobalIDManager
 from appearence_utils import compute_team_appearence, keypoints_to_pose_vec
 
-# ================= ROI / MASK =================
-# Mask for View 1
-TRAPEZ_TOP_LEFT_1 = (200, 340)
-TRAPEZ_TOP_RIGHT_1 = (1240, 340)
-TRAPEZ_BOTTOM_LEFT_1 = (0, 665)
-TRAPEZ_BOTTOM_RIGHT_1 = (1440, 635)
-CURVE_HEIGHT_1 = 70
-
-# Mask for View 2
-TRAPEZ_TOP_LEFT_2 = (0, 0)
-TRAPEZ_TOP_RIGHT_2 = (1440, 0)
-TRAPEZ_BOTTOM_LEFT_2 = (0, 810)
-TRAPEZ_BOTTOM_RIGHT_2 = (1440, 810)
-CURVE_HEIGHT_2 = 0
-
 # ================= UTILITIES =================
 
 def round_to_multiple(value, multiple):
     return multiple * ((value + multiple - 1) // multiple)
-
-
-def create_trapezoid_mask(frame_shape, tl, tr, bl, br, curve_height=0):
-    mask = np.zeros(frame_shape[:2], dtype=np.uint8)
-    pts = [np.array([tl, tr, br, bl], dtype=np.int32)]
-    if curve_height > 0:
-        curve = [tl, tr, br]
-        for i in range(1, 20):
-            t = i / 20
-            x = br[0] + (bl[0] - br[0]) * t
-            y = br[1] + (bl[1] - br[1]) * t + curve_height * (4 * t * (1 - t))
-            curve.append((int(x), int(y)))
-        curve.append(bl)
-        pts = [np.array(curve, dtype=np.int32)]
-    cv.fillPoly(mask, pts, 255)
-    return mask, pts[0]
-
-
-def apply_trapezoid_mask(frame, mask):
-    return cv.bitwise_and(frame, frame, mask=mask)
 
 
 def pad_bbox(bbox, pad_ratio, frame_shape):
@@ -125,6 +90,20 @@ def draw_text_with_bg(img, text, pos, scale=0.6):
     x, y = pos
     cv.rectangle(img, (x, y - th - 10), (x + tw + 20, y + b + 10), (0, 0, 0), -1)
     cv.putText(img, text, (x + 10, y), font, scale, (255, 255, 255), 2)
+
+
+def resize_for_display(img, max_width=1280, max_height=720):
+    if img is None:
+        return img
+    h, w = img.shape[:2]
+    if w <= 0 or h <= 0:
+        return img
+    scale = min(max_width / float(w), max_height / float(h), 1.0)
+    if scale >= 1.0:
+        return img
+    out_w = max(1, int(round(w * scale)))
+    out_h = max(1, int(round(h * scale)))
+    return cv.resize(img, (out_w, out_h), interpolation=cv.INTER_AREA)
 
 
 def parse_yolo_annotations(anno_file, img_width, img_height, frame, pose_model, pose_attempts, 
@@ -245,27 +224,45 @@ def draw_tracks(img, tracks, max_tracks, connections, tracker_self):
 
     return img
 
-def _augment_event_with_world_pos(event, tracker):
-    """Attach world position (x,y,z) to an event if track has it."""
+def _augment_event_with_view_and_projected_pos(event, tracker, homography_to_other):
+    """Attach own-view bottom center and projected point in the other view."""
+    event['view_x'] = ''
+    event['view_y'] = ''
+    event['view_pos_json'] = ''
+    event['has_view_pos'] = 0
+    event['projected_other_x'] = ''
+    event['projected_other_y'] = ''
+    event['projected_other_pos_json'] = ''
+    event['has_projected_other_pos'] = 0
+
     if tracker is None:
         return event
+
     tid = event.get('track_id')
     if tid is None:
         return event
+
     track = next((t for t in tracker.tracks if t.get('track_id') == tid), None)
-    wp = track.get('world_pos') if track else None
-    if wp is not None and len(wp) >= 3:
-        event['world_x'] = float(wp[0])
-        event['world_y'] = float(wp[1])
-        event['world_z'] = float(wp[2])
-        event['world_pos_json'] = json.dumps([float(wp[0]), float(wp[1]), float(wp[2])])
-        event['has_world_pos'] = 1
-    else:
-        event['world_x'] = ''
-        event['world_y'] = ''
-        event['world_z'] = ''
-        event['world_pos_json'] = ''
-        event['has_world_pos'] = 0
+    bbox = track.get('bbox') if track else None
+    if bbox is None:
+        return event
+
+    view_pt = _bbox_bottom_center(bbox)
+    if np.all(np.isfinite(view_pt)):
+        vx, vy = float(view_pt[0]), float(view_pt[1])
+        event['view_x'] = vx
+        event['view_y'] = vy
+        event['view_pos_json'] = json.dumps([vx, vy])
+        event['has_view_pos'] = 1
+
+        if homography_to_other is not None:
+            proj_pt = project_point_with_homography(view_pt, homography_to_other)
+            if np.all(np.isfinite(proj_pt)):
+                px, py = float(proj_pt[0]), float(proj_pt[1])
+                event['projected_other_x'] = px
+                event['projected_other_y'] = py
+                event['projected_other_pos_json'] = json.dumps([px, py])
+                event['has_projected_other_pos'] = 1
     return event
 
 # ================= MAIN =================
@@ -317,6 +314,61 @@ def load_calibration(calib_path):
         return json.load(f)
 
 
+def load_homographies_for_views(homography_path):
+    if not homography_path or not os.path.exists(homography_path):
+        raise FileNotFoundError(f"Homography file not found: {homography_path}")
+    with open(homography_path, 'r') as f:
+        data = json.load(f)
+
+    if 'H' not in data or 'H_inv' not in data:
+        raise ValueError(
+            f"Homography file {homography_path} must contain both 'H' and 'H_inv'."
+        )
+
+    # In this project file:
+    # - H maps cam4 -> cam13
+    # - H_inv maps cam13 -> cam4
+    h_view2_to_view1 = np.array(data['H'], dtype=np.float32)
+    h_view1_to_view2 = np.array(data['H_inv'], dtype=np.float32)
+    return h_view1_to_view2, h_view2_to_view1
+
+
+def project_point_with_homography(pt_xy, homography):
+    src = np.array([[pt_xy]], dtype=np.float32)
+    dst = cv.perspectiveTransform(src, homography)
+    return dst[0, 0]
+
+
+def scale_homography_for_resized_views(
+    homography,
+    src_orig_size,
+    dst_orig_size,
+    src_proc_size,
+    dst_proc_size,
+):
+    """
+    Convert a homography defined on original resolutions to processing resolutions.
+
+    homography maps src_orig pixels -> dst_orig pixels.
+    Returned matrix maps src_proc pixels -> dst_proc pixels.
+    """
+    src_ow, src_oh = src_orig_size
+    dst_ow, dst_oh = dst_orig_size
+    src_pw, src_ph = src_proc_size
+    dst_pw, dst_ph = dst_proc_size
+
+    sx_src = float(src_pw) / float(src_ow)
+    sy_src = float(src_ph) / float(src_oh)
+    sx_dst = float(dst_pw) / float(dst_ow)
+    sy_dst = float(dst_ph) / float(dst_oh)
+
+    s_src = np.array([[sx_src, 0.0, 0.0], [0.0, sy_src, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+    s_dst = np.array([[sx_dst, 0.0, 0.0], [0.0, sy_dst, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+
+    h_scaled = s_dst @ homography @ np.linalg.inv(s_src)
+    return h_scaled.astype(np.float32)
+
+
 def load_indexed_points(points_path):
     if not points_path or not os.path.exists(points_path):
         return {}
@@ -356,35 +408,6 @@ def load_court_lines(lines_path, points_by_idx):
     return lines
 
 
-def compute_common_ref_points(points_by_idx1, points_by_idx2):
-    """
-    Compute reference points using only corners common to both views.
-    Returns (ref1, ref2) in each view's pixel space (unscaled).
-    """
-    if not points_by_idx1 or not points_by_idx2:
-        return None, None
-    common_idx = sorted(set(points_by_idx1.keys()) & set(points_by_idx2.keys()))
-    if not common_idx:
-        return None, None
-    pts1 = np.array([points_by_idx1[i] for i in common_idx], dtype=np.float32)
-    pts2 = np.array([points_by_idx2[i] for i in common_idx], dtype=np.float32)
-    if pts1.size == 0 or pts2.size == 0:
-        return None, None
-    return pts1.mean(axis=0), pts2.mean(axis=0)
-
-
-def load_line_correspondences(path, view1_key, view2_key):
-    if not path or not os.path.exists(path):
-        return []
-    with open(path, 'r') as f:
-        data = json.load(f)
-    pairs = []
-    for item in data.get('lines_corrispondency', []):
-        if view1_key in item and view2_key in item:
-            pairs.append((int(item[view1_key]), int(item[view2_key])))
-    return pairs
-
-
 def scale_lines(lines, sx, sy):
     if sx is None or sy is None:
         return lines
@@ -415,89 +438,96 @@ def draw_court_lines(img, lines, color=(0, 255, 0), thickness=2, label=True):
                        cv.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
     return img
 
-
-def _signed_point_line_distance(pt, line, ref_pt=None):
-    """
-    Signed distance from point to line. If ref_pt is provided, the sign is
-    oriented so that ref_pt lies on the positive side for consistency.
-    """
+def _is_point_above_line_segment(pt, line, ref_pt):
     p1 = line['p1']
     p2 = line['p2']
+    x = float(pt[0])
+
+    min_x = min(float(p1[0]), float(p2[0]))
+    max_x = max(float(p1[0]), float(p2[0]))
+    if x < (min_x - 1.0) or x > (max_x + 1.0):
+        return False
+
     v = p2 - p1
     denom = np.linalg.norm(v)
     if denom <= 1e-6:
-        return 0.0
-    n = np.array([-v[1], v[0]], dtype=np.float32)  # perpendicular
+        return False
+
+    n = np.array([-v[1], v[0]], dtype=np.float32)
     d = float(np.dot((pt - p1), n) / denom)
-    if ref_pt is not None:
-        ref_side = float(np.dot((ref_pt - p1), n))
-        if ref_side < 0:
-            d = -d
-    return d
+    ref_side = float(np.dot((ref_pt - p1), n))
+    if ref_side < 0:
+        d = -d
+
+    return d < 0.0
 
 
-def _line_signature(pt, lines, ref_pt=None):
-    if pt is None or not lines:
-        return None
-    dists = np.array([_signed_point_line_distance(pt, l, ref_pt=ref_pt) for l in lines],
-                     dtype=np.float32)
-    norm = np.linalg.norm(dists)
-    if norm <= 1e-6:
-        return None
-    return dists / norm
+def _filter_detections_above_lines(detections, lines, ref_pt):
+    if not lines:
+        return detections
+
+    if ref_pt is None:
+        xs = []
+        ys = []
+        for l in lines:
+            xs.extend([float(l['p1'][0]), float(l['p2'][0])])
+            ys.extend([float(l['p1'][1]), float(l['p2'][1])])
+        ref_pt = np.array([np.mean(xs), max(ys) + 100.0], dtype=np.float32)
+
+    valid = []
+    for d in detections:
+        x1, y1, x2, y2 = d['bbox']
+        bottom_center = np.array([(x1 + x2) / 2.0, y2], dtype=np.float32)
+        invalid = False
+        for line in lines:
+            if _is_point_above_line_segment(bottom_center, line, ref_pt):
+                invalid = True
+                break
+        if not invalid:
+            valid.append(d)
+    return valid
 
 
-def _smooth_penalty(value, threshold, margin, min_scale=0.4):
-    if value is None or threshold is None or margin is None or margin <= 0:
-        return 1.0
-    if value <= threshold:
-        return 1.0
-    if value >= threshold + margin:
-        return min_scale
-    t = (value - threshold) / margin
-    return 1.0 - t * (1.0 - min_scale)
-
-def detect_view(frame, frame_id, annotations, size, mask, det_model,
+def detect_view(frame, frame_id, annotations, det_model,
                 sahi_conf_threshold, sahi_iou_threshold, slice_h, slice_w,
                 slice_overlap, pose_model, pose_attempts, pose_conf_threshold,
                 pose_iou_threshold, tracker,
-                suppress_nested=True, nested_contain_thresh=0.9, nested_area_ratio=0.6):
+                suppress_nested=True, nested_contain_thresh=0.9, nested_area_ratio=0.6,
+                invalid_if_above_lines=None, invalid_ref_pt=None):
     detections = []
+    frame_h, frame_w = frame.shape[:2]
     if frame_id in annotations:
         for anno_file in annotations[frame_id]:
             detections.extend(parse_yolo_annotations(
-                anno_file, size[0], size[1], frame, pose_model, pose_attempts,
+                anno_file, frame_w, frame_h, frame, pose_model, pose_attempts,
                 pose_conf_threshold, pose_iou_threshold, tracker=tracker
             ))
     else:
-        roi = apply_trapezoid_mask(frame, mask)
-        mask_2d = np.any(roi > 0, axis=2)
-        if np.any(mask_2d):
-            coords = np.where(mask_2d)
-            min_y, max_y = coords[0].min(), coords[0].max()
-            min_x, max_x = coords[1].min(), coords[1].max()
-            cropped = roi[min_y:max_y + 1, min_x:max_x + 1]
+        preds = get_sliced_prediction(
+            frame, det_model, slice_height=slice_h, slice_width=slice_w,
+            overlap_height_ratio=slice_overlap, overlap_width_ratio=slice_overlap,
+            postprocess_match_metric='IOU', postprocess_match_threshold=sahi_iou_threshold,
+            verbose=0
+        )
 
-            preds = get_sliced_prediction(
-                cropped, det_model, slice_height=slice_h, slice_width=slice_w,
-                overlap_height_ratio=slice_overlap, overlap_width_ratio=slice_overlap,
-                postprocess_match_metric='IOU', postprocess_match_threshold=sahi_iou_threshold,
-                verbose=0
-            )
+        if preds and preds.object_prediction_list:
+            for p in preds.object_prediction_list:
+                if p.category.id == 0 and p.score.value >= sahi_conf_threshold:
+                    bx1, by1, bx2, by2 = map(int, p.bbox.to_xyxy())
+                    bbox = (bx1, by1, bx2, by2)
+                    appearance = compute_team_appearence(frame, bbox)
+                    world_pos = tracker.project_to_world(bbox)
+                    detections.append({
+                        'bbox': bbox,
+                        'appearance': appearance,
+                        'world_pos': world_pos,
+                        'score': p.score.value
+                    })
 
-            if preds and preds.object_prediction_list:
-                for p in preds.object_prediction_list:
-                    if p.category.id == 0 and p.score.value >= sahi_conf_threshold:
-                        bx1, by1, bx2, by2 = map(int, p.bbox.to_xyxy())
-                        bbox = (bx1 + min_x, by1 + min_y, bx2 + min_x, by2 + min_y)
-                        appearance = compute_team_appearence(frame, bbox)
-                        world_pos = tracker.project_to_world(bbox)
-                        detections.append({
-                            'bbox': bbox,
-                            'appearance': appearance,
-                            'world_pos': world_pos,
-                            'score': p.score.value
-                        })
+    if invalid_if_above_lines:
+        detections = _filter_detections_above_lines(
+            detections, invalid_if_above_lines, invalid_ref_pt
+        )
 
     if suppress_nested:
         detections = _suppress_nested_detections(
@@ -514,17 +544,8 @@ def detect_view(frame, frame_id, annotations, size, mask, det_model,
             )
             d['keypoints'] = kpts
             d['pose_vec'] = vec
-        if d.get('keypoints') is not None:
-            kpts = d['keypoints']
-            candidates = []
-            for idx in (15, 16, 11, 12):
-                if idx < len(kpts):
-                    x, y = kpts[idx]
-                    if x > 0 and y > 0:
-                        candidates.append((x, y))
-            if candidates:
-                px, py = max(candidates, key=lambda p: p[1])
-                d['world_pos'] = tracker.project_pixel_to_world(px, py)
+        # Force bbox-bottom-center anchoring for world coordinates.
+        d['world_pos'] = tracker.project_to_world(d['bbox']) if tracker else None
 
     return detections
 
@@ -532,11 +553,14 @@ def detect_view(frame, frame_id, annotations, size, mask, det_model,
 def merge_track_global_id(tracker, track, target_gid, frame_id):
     if track['global_id'] == target_gid:
         return True
-    existing = tracker.global_id_to_track.get(target_gid)
-    if existing is not None and existing is not track:
-        return False
+    if hasattr(tracker, 'reassign_track_global_id'):
+        return bool(
+            tracker.reassign_track_global_id(
+                track, target_gid, frame_id, allow_target_conflict=False
+            )
+        )
     tracker.merge_global_ids(track['global_id'], target_gid, frame_id)
-    return True
+    return track.get('global_id') == target_gid
 
 
 def _bbox_bottom_center(bbox):
@@ -544,361 +568,48 @@ def _bbox_bottom_center(bbox):
     return np.array([(x1 + x2) / 2.0, y2], dtype=np.float32)
 
 
-def _reproj_error(tracker, world_pos, bbox):
-    if world_pos is None:
-        return None
-    px = tracker.project_to_pixel(world_pos)
-    if px is None:
-        return None
-    return float(np.linalg.norm(px - _bbox_bottom_center(bbox)))
-
-
-def _pose_anchor_pixel(track):
-    kpts = track.get('keypoints')
-    if kpts is None:
-        return None
-    candidates = []
-    for idx in (15, 16, 11, 12, 13, 14):
-        if idx < len(kpts):
-            x, y = kpts[idx]
-            if x > 0 and y > 0:
-                candidates.append((x, y))
-    if not candidates:
-        return None
-    return max(candidates, key=lambda p: p[1])
-
-
-def _track_anchor_pixel(track):
-    p = _pose_anchor_pixel(track)
-    if p is not None:
-        return np.array(p, dtype=np.float32)
-    bbox = track.get('bbox')
-    if bbox is None:
-        return None
-    return _bbox_bottom_center(bbox)
-
-
-def _triangulate_world_pos(tracker1, tracker2, p1, p2, max_reproj_error=50.0):
-    if not hasattr(tracker1, 'P') or not hasattr(tracker2, 'P'):
-        return None
-    p1 = np.array(p1, dtype=np.float32)
-    p2 = np.array(p2, dtype=np.float32)
-
-    if tracker1.is_rectified:
-        p1_norm = cv.undistortPoints(p1.reshape(1, 1, 2), tracker1.mtx, None, P=np.eye(3))
-        p2_norm = cv.undistortPoints(p2.reshape(1, 1, 2), tracker2.mtx, None, P=np.eye(3))
-    else:
-        p1_norm = cv.undistortPoints(p1.reshape(1, 1, 2), tracker1.mtx, tracker1.dist, P=np.eye(3))
-        p2_norm = cv.undistortPoints(p2.reshape(1, 1, 2), tracker2.mtx, tracker2.dist, P=np.eye(3))
-
-    p4d = cv.triangulatePoints(tracker1.P, tracker2.P,
-                               p1_norm.reshape(2, 1),
-                               p2_norm.reshape(2, 1))
-    p3d = (p4d[:3] / p4d[3]).flatten()
-
-    # Validate reprojection
-    pts_3d = np.array([p3d], dtype=np.float32)
-    img_pts1, _ = cv.projectPoints(pts_3d, tracker1.rvec, tracker1.tvec, tracker1.mtx, tracker1.dist)
-    img_pts2, _ = cv.projectPoints(pts_3d, tracker2.rvec, tracker2.tvec, tracker2.mtx, tracker2.dist)
-    err1 = np.linalg.norm(img_pts1[0][0] - p1)
-    err2 = np.linalg.norm(img_pts2[0][0] - p2)
-    if err1 > max_reproj_error or err2 > max_reproj_error:
-        return None
-    return p3d
-
-
-class TrackletStore:
-    def __init__(self):
-        self.stats = {}
-
-    def update(self, view_id, tracks):
-        for t in tracks:
-            if not t.get('updated'):
-                continue
-            key = (view_id, t['track_id'])
-            s = self.stats.get(key)
-            if s is None:
-                s = {
-                    'count': 0,
-                    'app_sum': None,
-                    'app_count': 0,
-                    'pose_sum': None,
-                    'pose_count': 0,
-                    'world_sum': None,
-                    'world_count': 0,
-                    'anchor_gid': None
-                }
-                self.stats[key] = s
-            s['count'] += 1
-
-            if t.get('gid_source') == 'annotation' and s['anchor_gid'] is None:
-                s['anchor_gid'] = t.get('global_id')
-
-            app = t.get('appearance')
-            if app is not None:
-                if s['app_sum'] is None:
-                    s['app_sum'] = app.astype(np.float32).copy()
-                else:
-                    s['app_sum'] += app
-                s['app_count'] += 1
-
-            pose = t.get('pose_vec')
-            if pose is not None:
-                if s['pose_sum'] is None:
-                    s['pose_sum'] = pose.astype(np.float32).copy()
-                else:
-                    s['pose_sum'] += pose
-                s['pose_count'] += 1
-
-            wp = t.get('world_pos')
-            if wp is not None and len(wp) >= 2:
-                wp_arr = np.array([wp[0], wp[1], 0.0], dtype=np.float32)
-                if s['world_sum'] is None:
-                    s['world_sum'] = wp_arr.copy()
-                else:
-                    s['world_sum'] += wp_arr
-                s['world_count'] += 1
-
-    def get_features(self, view_id, track_id, min_len=5):
-        s = self.stats.get((view_id, track_id))
-        if not s:
-            return None
-        if s['anchor_gid'] is None and s['count'] < min_len:
-            return None
-
-        app = None
-        if s['app_count'] > 0:
-            app = s['app_sum'] / float(s['app_count'])
-            norm = np.linalg.norm(app)
-            if norm > 0:
-                app = app / norm
-
-        pose = None
-        if s['pose_count'] > 0:
-            pose = s['pose_sum'] / float(s['pose_count'])
-
-        wp = None
-        if s['world_count'] > 0:
-            wp = s['world_sum'] / float(s['world_count'])
-
-        return {
-            'appearance': app,
-            'pose_vec': pose,
-            'world_pos': wp,
-            'anchor_gid': s['anchor_gid']
-        }
-
-    def get_anchor_gid(self, view_id, track_id):
-        s = self.stats.get((view_id, track_id))
-        if not s:
-            return None
-        return s.get('anchor_gid')
-
-
-def associate_tracks_to_view1(tracker1, tracker_other, frame_id,
-                              match_threshold, app_weight=0.4, world_weight=0.6,
-                              max_world_dist=None, world_dist_tolerance=0.0,
-                              reproj_max_px=120.0, reproj_soft_margin=40.0,
-                              line_sig_lines_anchor=None, line_sig_lines_other=None,
-                              line_sig_ref_anchor=None, line_sig_ref_other=None,
-                              line_sig_thresh=0.15,
-                              line_sig_debug_frames=None,
-                              prev_assoc=None, sticky_bonus=0.08,
-                              conflict_log=None, conflict_view_id=None,
-                              view_id_other=None,
-                              tracklet_min_frames=5,
-                              tracklet_store=None,
-                              use_pose_triangulation=True,
-                              pose_triangulation_max_reproj=50.0,
-                              always_overwrite_gid=False,
-                              anchor_view_id=1,):
-    active1 = [t for t in tracker1.tracks if t['updated']]
-    active_other = [t for t in tracker_other.tracks if t['updated']]
-
+def associate_tracks_to_view1(
+    tracker1, tracker_other, frame_id,
+    homography_anchor_to_other,
+    max_projected_dist_px=120.0,
+):
+    active1 = [t for t in tracker1.tracks if t.get('updated') and t.get('bbox') is not None]
+    active_other = [t for t in tracker_other.tracks if t.get('updated') and t.get('bbox') is not None]
     if not active1 or not active_other:
         return
 
-    pose_points1 = []
-    pose_points2 = []
-    if use_pose_triangulation:
-        for t in active1:
-            pose_points1.append(_pose_anchor_pixel(t))
-        for t in active_other:
-            pose_points2.append(_pose_anchor_pixel(t))
+    projected = []
+    for t1 in active1:
+        p1 = _bbox_bottom_center(t1['bbox'])
+        p_other = project_point_with_homography(p1, homography_anchor_to_other)
+        projected.append(p_other)
 
-    w_norm = app_weight + world_weight
-    if w_norm == 0:
-        return
-    app_weight /= w_norm
-    world_weight /= w_norm
+    other_points = [_bbox_bottom_center(t2['bbox']) for t2 in active_other]
 
-    line_sigs_1 = None
-    line_sigs_2 = None
-    if line_sig_lines_anchor and line_sig_lines_other:
-        line_sigs_1 = []
-        for t in active1:
-            p1_px = _track_anchor_pixel(t)
-            line_sigs_1.append(_line_signature(p1_px, line_sig_lines_anchor, ref_pt=line_sig_ref_anchor))
-        line_sigs_2 = []
-        for t in active_other:
-            p2_px = _track_anchor_pixel(t)
-            line_sigs_2.append(_line_signature(p2_px, line_sig_lines_other, ref_pt=line_sig_ref_other))
-
-    cost = np.zeros((len(active1), len(active_other)), dtype=np.float32)
-    for i, t1 in enumerate(active1):
-        for j, t2 in enumerate(active_other):
-            anchor_gid1 = tracklet_store.get_anchor_gid(anchor_view_id, t1['track_id']) if tracklet_store else None
-            anchor_gid2 = tracklet_store.get_anchor_gid(view_id_other, t2['track_id']) if tracklet_store else None
-            t1_annot = t1.get('gid_source') == 'annotation' or anchor_gid1 is not None
-            t2_annot = t2.get('gid_source') == 'annotation' or anchor_gid2 is not None
-            gid1 = anchor_gid1 if anchor_gid1 is not None else t1.get('global_id')
-            gid2 = anchor_gid2 if anchor_gid2 is not None else t2.get('global_id')
-            if t1_annot and t2_annot and gid1 != gid2:
-                if conflict_log is not None:
-                    conflict_log.append({
-                        'frame': frame_id,
-                        'view': conflict_view_id,
-                        'view1_track_id': t1['track_id'],
-                        'view1_global_id': gid1,
-                        'other_track_id': t2['track_id'],
-                        'other_global_id': gid2,
-                        'reason': 'annotated_gid_mismatch'
-                    })
-                # Hard-force annotations: anchor view wins even if mismatched
-                cost[i, j] = 0.0
-                continue
-            elif t1_annot and t2_annot and gid1 == gid2:
-                cost[i, j] = 0.0
-                continue
-            app1 = t1.get('appearance')
-            app2 = t2.get('appearance')
-            pose1 = t1.get('pose_vec')
-            pose2 = t2.get('pose_vec')
-            wp1 = t1.get('world_pos')
-            wp2 = t2.get('world_pos')
-
-            if tracklet_store is not None:
-                f1 = tracklet_store.get_features(anchor_view_id, t1['track_id'], tracklet_min_frames)
-                if f1 is not None:
-                    if f1.get('appearance') is not None:
-                        app1 = f1['appearance']
-                    if f1.get('pose_vec') is not None:
-                        pose1 = f1['pose_vec']
-                    if f1.get('world_pos') is not None:
-                        wp1 = f1['world_pos']
-                f2 = tracklet_store.get_features(view_id_other, t2['track_id'], tracklet_min_frames)
-                if f2 is not None:
-                    if f2.get('appearance') is not None:
-                        app2 = f2['appearance']
-                    if f2.get('pose_vec') is not None:
-                        pose2 = f2['pose_vec']
-                    if f2.get('world_pos') is not None:
-                        wp2 = f2['world_pos']
-
-            app_sim = tracker1._appearance_sim(app1, app2)
-
-            if use_pose_triangulation:
-                p1 = pose_points1[i]
-                p2 = pose_points2[j]
-                if p1 is not None and p2 is not None:
-                    tri = _triangulate_world_pos(
-                        tracker1, tracker_other, p1, p2,
-                        max_reproj_error=pose_triangulation_max_reproj
-                    )
-                    if tri is not None:
-                        wp1 = tri
-                        wp2 = tri
-
-            world_sim = tracker1._world_pos_sim(wp1, wp2)
-            
-            sim = app_weight * app_sim + world_weight * world_sim
-
-            if line_sigs_1 is not None and line_sigs_2 is not None:
-                sig1 = line_sigs_1[i]
-                sig2 = line_sigs_2[j]
-                if sig1 is not None and sig2 is not None:
-                    sig_dist = float(np.linalg.norm(sig1 - sig2))
-                    if line_sig_debug_frames is not None and frame_id in line_sig_debug_frames:
-                        print(
-                            f"[line_sig] frame={frame_id} view_other={view_id_other} "
-                            f"t1={t1.get('track_id')} t2={t2.get('track_id')} "
-                            f"gid1={t1.get('global_id')} gid2={t2.get('global_id')} "
-                            f"dist={sig_dist:.4f} thresh={line_sig_thresh}"
-                        )
-                    if sig_dist > line_sig_thresh:
-                        cost[i, j] = 1.0 - sim + 1.0
-                        continue
-
-            if wp1 is not None and wp2 is not None:
-                dist = np.linalg.norm(np.array(wp1[:2]) - np.array(wp2[:2]))
-                if max_world_dist is not None and dist > (max_world_dist + world_dist_tolerance):
-                    sim *= _smooth_penalty(
-                        dist, max_world_dist + world_dist_tolerance,
-                        max(1.0, world_dist_tolerance), min_scale=0.4
-                    )
-
-                if reproj_max_px is not None:
-                    err_1 = _reproj_error(tracker1, wp2, t1['bbox'])
-                    err_2 = _reproj_error(tracker_other, wp1, t2['bbox'])
-                    worst_err = max(e for e in (err_1, err_2) if e is not None) if (err_1 or err_2) else None
-                    if worst_err is not None:
-                        if worst_err > (reproj_max_px - reproj_soft_margin):
-                            sim *= _smooth_penalty(
-                                worst_err, reproj_max_px - reproj_soft_margin,
-                                reproj_soft_margin, min_scale=0.4
-                            )
-
-            if prev_assoc is not None:
-                prev_gid = prev_assoc.get(t2['track_id'])
-                if prev_gid is not None and prev_gid == t1['global_id']:
-                    sim = min(1.0, sim + sticky_bonus)
-                if t2_annot and gid1 == gid2:
-                    sim = min(1.0, sim + 0.2)
-
-            cost[i, j] = 1.0 - sim
+    large = 1e9
+    cost = np.full((len(active1), len(active_other)), large, dtype=np.float32)
+    for i, p_proj in enumerate(projected):
+        if not np.all(np.isfinite(p_proj)):
+            continue
+        for j, p_other in enumerate(other_points):
+            cost[i, j] = float(np.linalg.norm(p_proj - p_other))
 
     row_ind, col_ind = linear_sum_assignment(cost)
-    matched_other_ids = set()
+
     for r, c in zip(row_ind, col_ind):
-        if cost[r, c] <= (1.0 - match_threshold):
-            t1 = active1[r]
-            t2 = active_other[c]
-            sim = 1.0 - cost[r, c]
-            # Decide target GID
-            anchor_gid1 = tracklet_store.get_anchor_gid(anchor_view_id, t1['track_id']) if tracklet_store else None
-            anchor_gid2 = tracklet_store.get_anchor_gid(view_id_other, t2['track_id']) if tracklet_store else None
-            t1_annot = t1.get('gid_source') == 'annotation' or anchor_gid1 is not None
-            t2_annot = t2.get('gid_source') == 'annotation' or anchor_gid2 is not None
-            if t2_annot and not t1_annot:
-                target_gid = anchor_gid2 if anchor_gid2 is not None else t2['global_id']
-            elif t1_annot and not t2_annot:
-                target_gid = anchor_gid1 if anchor_gid1 is not None else t1['global_id']
-            elif t1_annot and t2_annot:
-                target_gid = anchor_gid1 if anchor_gid1 is not None else t1['global_id']
-            else:
-                if always_overwrite_gid:
-                    s1 = t1.get('start_frame', frame_id)
-                    s2 = t2.get('start_frame', frame_id)
-                    if s2 < s1:
-                        target_gid = t2['global_id']
-                    else:
-                        target_gid = t1['global_id']
-                else:
-                    target_gid = t1['global_id']
+        dist = float(cost[r, c])
+        if dist > max_projected_dist_px:
+            continue
 
-            merge_track_global_id(tracker1, t1, target_gid, frame_id)
-            merge_track_global_id(tracker_other, t2, target_gid, frame_id)
-            if t2_annot and not t1_annot:
-                t1['gid_source'] = 'annotation'
-            matched_other_ids.add(t2['track_id'])
-            if prev_assoc is not None:
-                prev_assoc[t2['track_id']] = t2['global_id'] if t2.get('gid_source') == 'annotation' else t1['global_id']
+        t1 = active1[r]
+        t2 = active_other[c]
 
-    if prev_assoc is not None:
-        active_other_ids = {t['track_id'] for t in active_other}
-        for tid in list(prev_assoc.keys()):
-            if tid not in active_other_ids:
-                del prev_assoc[tid]
+        gid1 = t1['global_id']
+        target_gid = gid1
+        merged1 = merge_track_global_id(tracker1, t1, target_gid, frame_id)
+        merged2 = merge_track_global_id(tracker_other, t2, target_gid, frame_id)
+        if merged1 and merged2 and t1.get('gid_source') == 'annotation':
+            t2['gid_source'] = 'annotation'
 
 
 def yolo_sahi_pose_tracking(
@@ -915,9 +626,9 @@ def yolo_sahi_pose_tracking(
     start_frame=0,
     auto_start_from_annotations=True,
     enable_pose=True,
-    size=(1440, 810),
+    size=(1440, 810),  # Processing resolution (display uses same max size).
     # detection View 1
-    sahi_conf_threshold1=0.45,
+    sahi_conf_threshold1=0.40,
     sahi_iou_threshold1=0.40,
     slice_h1=480,
     slice_w1=480,
@@ -935,20 +646,16 @@ def yolo_sahi_pose_tracking(
     appearance_weight1=0.35,
     pose_weight1=0.0,
     ema_alpha1=0.5,
-    max_velocity1=800.0,
+    max_velocity1=500.0,
     suppress_nested_tracks1=True,
     nested_track_contain_thresh1=0.9,
     nested_track_area_ratio1=0.6,
     nested_track_app_sim1=0.7,
-    cross_view_match_threshold1=0.15,
-    world_dist_weight1=0.5,
-    world_dist_tolerance1=150.0,
-    reproj_max_px1=120.0,
-    reproj_soft_margin1=40.0,
+    cross_view_max_dist_px1=120.0,
     max_missed_frames1=80,
     # detection View 2
-    sahi_conf_threshold2=0.7,
-    sahi_iou_threshold2=0.55,
+    sahi_conf_threshold2=0.75,
+    sahi_iou_threshold2=0.50,
     slice_h2=640,
     slice_w2=640,
     slice_overlap2=0.05,
@@ -965,37 +672,21 @@ def yolo_sahi_pose_tracking(
     appearance_weight2=0.35,
     pose_weight2=0.0,
     ema_alpha2=0.5,
-    max_velocity2=800.0,
+    max_velocity2=500.0,
     suppress_nested_tracks2=True,
     nested_track_contain_thresh2=0.9,
-    nested_track_area_ratio2=0.6,
+    nested_track_area_ratio2=0.68,
     nested_track_app_sim2=0.7,
-    cross_view_match_threshold2=0.15,
-    world_dist_weight2=0.5,
-    world_dist_tolerance2=150.0,
-    reproj_max_px2=120.0,
-    reproj_soft_margin2=40.0,
-    max_missed_frames2=300,
-    # tracklet-based reid
-    tracklet_min_frames=5,
-    use_pose_triangulation=True,
-    pose_triangulation_max_reproj=50.0,
+    cross_view_max_dist_px2=120.0,
+    max_missed_frames2=80,
+    homography_path='homography_cam4_to_cam13.json',
     suppress_nested_detections=True,
     nested_contain_thresh=0.9,
-    nested_area_ratio=0.6,
-    always_overwrite_gid=True,
-    # line-based alignment + debug
+    nested_area_ratio=0.68,
+    # line-based filtering + debug
+    invalid_view1_line_ids=(12, 13, 14),
     court_lines_path1=None,
-    court_lines_path2=None,
     court_corners_path1=None,
-    court_corners_path2=None,
-    court_line_correspondence_path=None,
-    court_line_view1_key='line_id_cam13',
-    court_line_view2_key='line_id_cam4',
-    draw_court_lines_debug=True,
-    line_sig_debug_frames=(12,),
-    # logging
-    conflict_log_path='annotation_conflicts.csv'
 ):
     """
     Multi-view tracking with single-view tracking + cross-view association.
@@ -1003,7 +694,7 @@ def yolo_sahi_pose_tracking(
     Flow:
     - Detect per-view and estimate pose
     - Track per-view independently
-    - Associate tracks across views using appearance + 3D position
+    - Associate tracks across views using homography-projected bottom centers
     """
     print("Starting FIXED yolo_sahi_pose_tracking")
     
@@ -1046,9 +737,6 @@ def yolo_sahi_pose_tracking(
         max_velocity=max_velocity1,
         camera_params=calib1,
         global_id_manager=shared_id_manager,
-        cross_view_match_threshold=cross_view_match_threshold1,
-        world_dist_weight=world_dist_weight1,
-        world_dist_tolerance=world_dist_tolerance1,
         is_rectified=True,  # FIX: Videos are rectified
         suppress_nested_tracks=suppress_nested_tracks1,
         nested_contain_thresh=nested_track_contain_thresh1,
@@ -1066,9 +754,6 @@ def yolo_sahi_pose_tracking(
         max_velocity=max_velocity2,
         camera_params=calib2,
         global_id_manager=shared_id_manager,
-        cross_view_match_threshold=cross_view_match_threshold2,
-        world_dist_weight=world_dist_weight2,
-        world_dist_tolerance=world_dist_tolerance2,
         is_rectified=True,  # FIX: Videos are rectified
         suppress_nested_tracks=suppress_nested_tracks2,
         nested_contain_thresh=nested_track_contain_thresh2,
@@ -1076,7 +761,10 @@ def yolo_sahi_pose_tracking(
         nested_app_sim_thresh=nested_track_app_sim2
     )
 
-    tracklet_store = None
+    h_view1_to_view2_raw, h_view2_to_view1_raw = load_homographies_for_views(homography_path)
+    process_size = (int(size[0]), int(size[1]))
+    if process_size[0] <= 0 or process_size[1] <= 0:
+        raise ValueError(f"Invalid processing size: {process_size}")
 
     # Open videos
     cap1 = cv.VideoCapture(source1)
@@ -1085,26 +773,13 @@ def yolo_sahi_pose_tracking(
     fps1 = int(cap1.get(cv.CAP_PROP_FPS)) or 25
     fps2 = int(cap2.get(cv.CAP_PROP_FPS)) or 25
 
-    # Create masks
-    mask1, _ = create_trapezoid_mask((size[1], size[0]),
-                                    TRAPEZ_TOP_LEFT_1, TRAPEZ_TOP_RIGHT_1, 
-                                    TRAPEZ_BOTTOM_LEFT_1, TRAPEZ_BOTTOM_RIGHT_1, 
-                                    CURVE_HEIGHT_1)
-    mask2, _ = create_trapezoid_mask((size[1], size[0]),
-                                    TRAPEZ_TOP_LEFT_2, TRAPEZ_TOP_RIGHT_2, 
-                                    TRAPEZ_BOTTOM_LEFT_2, TRAPEZ_BOTTOM_RIGHT_2, 
-                                    CURVE_HEIGHT_2)
-    # Create video writers
-    writer1 = cv.VideoWriter(output_path1, cv.VideoWriter_fourcc(*'mp4v'), fps1, size)
-    writer2 = cv.VideoWriter(output_path2, cv.VideoWriter_fourcc(*'mp4v'), fps2, size)
-
     # Create CSV writers
     csv_file1 = open(output_csv_path1, 'w', newline='')
-    csv_writer1 = csv.DictWriter(csv_file1, fieldnames=['frame', 'track_id', 'event', 'view', 'global_id', 'matched_with_other_view_track_id', 'new_global_id', 'old_global_id', 'world_x', 'world_y', 'world_z', 'world_pos_json', 'has_world_pos'])
+    csv_writer1 = csv.DictWriter(csv_file1, fieldnames=['frame', 'track_id', 'event', 'view', 'global_id', 'matched_with_other_view_track_id', 'new_global_id', 'old_global_id', 'view_x', 'view_y', 'view_pos_json', 'has_view_pos', 'projected_other_x', 'projected_other_y', 'projected_other_pos_json', 'has_projected_other_pos'])
     csv_writer1.writeheader()
 
     csv_file2 = open(output_csv_path2, 'w', newline='')
-    csv_writer2 = csv.DictWriter(csv_file2, fieldnames=['frame', 'track_id', 'event', 'view', 'global_id', 'matched_with_other_view_track_id', 'new_global_id', 'old_global_id', 'world_x', 'world_y', 'world_z', 'world_pos_json', 'has_world_pos'])
+    csv_writer2 = csv.DictWriter(csv_file2, fieldnames=['frame', 'track_id', 'event', 'view', 'global_id', 'matched_with_other_view_track_id', 'new_global_id', 'old_global_id', 'view_x', 'view_y', 'view_pos_json', 'has_view_pos', 'projected_other_x', 'projected_other_y', 'projected_other_pos_json', 'has_projected_other_pos'])
     csv_writer2.writeheader()
 
 
@@ -1118,18 +793,6 @@ def yolo_sahi_pose_tracking(
 
     frame_id = start_frame
     fps_hist = deque(maxlen=30)
-    prev_assoc_v2 = {}
-    prev_assoc_v1 = {}
-    conflict_log = []
-    conflict_writer = None
-    conflict_file = None
-    if conflict_log_path:
-        conflict_file = open(conflict_log_path, 'w', newline='')
-        conflict_writer = csv.DictWriter(conflict_file, fieldnames=[
-            'frame', 'view', 'view1_track_id', 'view1_global_id',
-            'other_track_id', 'other_global_id', 'reason'
-        ])
-        conflict_writer.writeheader()
 
     # Skip to start_frame
     for _ in range(start_frame):
@@ -1142,61 +805,66 @@ def yolo_sahi_pose_tracking(
     
     if not (ok1 and ok2):
         print("Error: Could not read initial frames")
+        cap1.release()
+        cap2.release()
+        csv_file1.close()
+        csv_file2.close()
         return
 
     orig_h1, orig_w1 = frame1.shape[:2]
     orig_h2, orig_w2 = frame2.shape[:2]
-    frame1 = cv.resize(frame1, size)
-    frame2 = cv.resize(frame2, size)
+    frame1 = cv.resize(frame1, process_size)
+    frame2 = cv.resize(frame2, process_size)
+
+    # Scale homographies from original camera resolution to processing resolution.
+    h_view1_to_view2 = scale_homography_for_resized_views(
+        h_view1_to_view2_raw,
+        src_orig_size=(orig_w1, orig_h1),
+        dst_orig_size=(orig_w2, orig_h2),
+        src_proc_size=process_size,
+        dst_proc_size=process_size,
+    )
+    h_view2_to_view1 = scale_homography_for_resized_views(
+        h_view2_to_view1_raw,
+        src_orig_size=(orig_w2, orig_h2),
+        dst_orig_size=(orig_w1, orig_h1),
+        src_proc_size=process_size,
+        dst_proc_size=process_size,
+    )
+
+    # Writers use the resized processing resolution.
+    writer1 = cv.VideoWriter(output_path1, cv.VideoWriter_fourcc(*'mp4v'), fps1, process_size)
+    writer2 = cv.VideoWriter(output_path2, cv.VideoWriter_fourcc(*'mp4v'), fps2, process_size)
+
     print(f"Processing initial frame {frame_id}")
 
     line_debug1 = []
-    line_debug2 = []
-    common_lines_1 = []
-    common_lines_2 = []
-    line_sig_ref_1 = None
-    line_sig_ref_2 = None
-    if court_lines_path1 and court_lines_path2 and court_corners_path1 and court_corners_path2 and court_line_correspondence_path:
-        sx1 = size[0] / float(orig_w1) if orig_w1 > 0 else 1.0
-        sy1 = size[1] / float(orig_h1) if orig_h1 > 0 else 1.0
-        sx2 = size[0] / float(orig_w2) if orig_w2 > 0 else 1.0
-        sy2 = size[1] / float(orig_h2) if orig_h2 > 0 else 1.0
+    invalid_view1_lines = []
+    invalid_view1_ref_pt = np.array([process_size[0] * 0.5, process_size[1] - 1.0], dtype=np.float32)
+    sx1 = process_size[0] / float(orig_w1) if orig_w1 > 0 else 1.0
+    sy1 = process_size[1] / float(orig_h1) if orig_h1 > 0 else 1.0
 
+    if court_lines_path1 and court_corners_path1:
         pts1 = load_indexed_points(court_corners_path1)
-        pts2 = load_indexed_points(court_corners_path2)
         lines1 = load_court_lines(court_lines_path1, pts1)
-        lines2 = load_court_lines(court_lines_path2, pts2)
         line_debug1 = scale_lines(lines1, sx1, sy1)
-        line_debug2 = scale_lines(lines2, sx2, sy2)
-        ref1, ref2 = compute_common_ref_points(pts1, pts2)
-        if ref1 is not None:
-            line_sig_ref_1 = np.array([ref1[0] * sx1, ref1[1] * sy1], dtype=np.float32)
-        if ref2 is not None:
-            line_sig_ref_2 = np.array([ref2[0] * sx2, ref2[1] * sy2], dtype=np.float32)
+        invalid_ids = {int(v) for v in invalid_view1_line_ids}
+        invalid_view1_lines = [l for l in line_debug1 if l['line_id'] in invalid_ids]
 
-        corr = load_line_correspondences(
-            court_line_correspondence_path, court_line_view1_key, court_line_view2_key
-        )
-        lines1_by_id = {l['line_id']: l for l in line_debug1}
-        lines2_by_id = {l['line_id']: l for l in line_debug2}
-        for lid1, lid2 in corr:
-            l1 = lines1_by_id.get(lid1)
-            l2 = lines2_by_id.get(lid2)
-            if l1 is not None and l2 is not None:
-                common_lines_1.append(l1)
-                common_lines_2.append(l2)
     initial_detections1 = detect_view(
-        frame1, frame_id, annotations1, size, mask1, det_model,
+        frame1, frame_id, annotations1, det_model,
         sahi_conf_threshold1, sahi_iou_threshold1, slice_h1, slice_w1,
         slice_overlap1, pose_model, pose_attempts1, pose_conf_threshold1,
         pose_iou_threshold1, tracker1,
         suppress_nested=suppress_nested_detections,
         nested_contain_thresh=nested_contain_thresh,
-        nested_area_ratio=nested_area_ratio
+        nested_area_ratio=nested_area_ratio,
+        invalid_if_above_lines=invalid_view1_lines,
+        invalid_ref_pt=invalid_view1_ref_pt
     )
 
     initial_detections2 = detect_view(
-        frame2, frame_id, annotations2, size, mask2, det_model,
+        frame2, frame_id, annotations2, det_model,
         sahi_conf_threshold2, sahi_iou_threshold2, slice_h2, slice_w2,
         slice_overlap2, pose_model, pose_attempts2, pose_conf_threshold2,
         pose_iou_threshold2, tracker2,
@@ -1214,74 +882,26 @@ def yolo_sahi_pose_tracking(
         initial_detections2, frame_id, finalize=True,
         resolve_conflicts=(frame_id not in annotations2)
     )
-    # tracklet aggregation disabled
-
-    # Associate tracks across views (View 1 as anchor)
+    # Associate tracks across views (one-way: View 1 -> View 2)
     associate_tracks_to_view1(
         tracker1, tracker2, frame_id,
-        tracker1.cross_view_match_threshold,
-        app_weight=appearance_weight1, world_weight=world_dist_weight1,
-        max_world_dist=2000.0, world_dist_tolerance=world_dist_tolerance1,
-        reproj_max_px=reproj_max_px1, reproj_soft_margin=reproj_soft_margin1,
-        prev_assoc=prev_assoc_v2, sticky_bonus=0.10,
-        conflict_log=conflict_log, conflict_view_id=2,
-        view_id_other=2,
-        tracklet_min_frames=tracklet_min_frames,
-        tracklet_store=tracklet_store,
-        use_pose_triangulation=use_pose_triangulation,
-        pose_triangulation_max_reproj=pose_triangulation_max_reproj,
-        always_overwrite_gid=always_overwrite_gid,
-        line_sig_lines_anchor=common_lines_1,
-        line_sig_lines_other=common_lines_2,
-        line_sig_ref_anchor=line_sig_ref_1,
-        line_sig_ref_other=line_sig_ref_2,
-        line_sig_thresh=0.15,
-        line_sig_debug_frames=line_sig_debug_frames,
-        anchor_view_id=1,
+        homography_anchor_to_other=h_view1_to_view2,
+        max_projected_dist_px=cross_view_max_dist_px1
     )
-    associate_tracks_to_view1(
-        tracker2, tracker1, frame_id,
-        tracker2.cross_view_match_threshold,
-        app_weight=appearance_weight2, world_weight=world_dist_weight2,
-        max_world_dist=2000.0, world_dist_tolerance=world_dist_tolerance2,
-        reproj_max_px=reproj_max_px2, reproj_soft_margin=reproj_soft_margin2,
-        prev_assoc=prev_assoc_v1, sticky_bonus=0.10,
-        conflict_log=conflict_log, conflict_view_id=1,
-        view_id_other=1,
-        tracklet_min_frames=tracklet_min_frames,
-        tracklet_store=tracklet_store,
-        use_pose_triangulation=use_pose_triangulation,
-        pose_triangulation_max_reproj=pose_triangulation_max_reproj,
-        always_overwrite_gid=always_overwrite_gid,
-        line_sig_lines_anchor=common_lines_2,
-        line_sig_lines_other=common_lines_1,
-        line_sig_ref_anchor=line_sig_ref_2,
-        line_sig_ref_other=line_sig_ref_1,
-        line_sig_thresh=0.15,
-        line_sig_debug_frames=line_sig_debug_frames,
-        anchor_view_id=2
-    )
-    if conflict_writer and conflict_log:
-        for row in conflict_log:
-            conflict_writer.writerow(row)
-        conflict_log.clear()
 
     # Log initial events
     for event in tracker1.get_frame_events():
         event['view'] = 1
-        _augment_event_with_world_pos(event, tracker1)
+        _augment_event_with_view_and_projected_pos(event, tracker1, h_view1_to_view2)
         csv_writer1.writerow(event)
     for event in tracker2.get_frame_events():
         event['view'] = 2
-        _augment_event_with_world_pos(event, tracker2)
+        _augment_event_with_view_and_projected_pos(event, tracker2, h_view2_to_view1)
         csv_writer2.writerow(event)
 
     # Save first frame
-    roi1 = apply_trapezoid_mask(frame1, mask1)
-    roi2 = apply_trapezoid_mask(frame2, mask2)
-    if draw_court_lines_debug:
-        roi1 = draw_court_lines(roi1, line_debug1, color=(0, 255, 0), thickness=2, label=True)
-        roi2 = draw_court_lines(roi2, line_debug2, color=(0, 255, 0), thickness=2, label=True)
+    roi1 = frame1
+    roi2 = frame2
     out1 = draw_tracks(roi1.copy(), tracks1, None, connections, tracker1)
     out2 = draw_tracks(roi2.copy(), tracks2, None, connections, tracker2)
     writer1.write(out1)
@@ -1300,22 +920,24 @@ def yolo_sahi_pose_tracking(
         if not (ok1 and ok2):
             break
 
-        frame1 = cv.resize(frame1, size)
-        frame2 = cv.resize(frame2, size)
+        frame1 = cv.resize(frame1, process_size)
+        frame2 = cv.resize(frame2, process_size)
         start_time = time.time()
 
         # ===== STEP 1: DETECTION + POSE =====
         detections1 = detect_view(
-            frame1, frame_id, annotations1, size, mask1, det_model,
+            frame1, frame_id, annotations1, det_model,
             sahi_conf_threshold1, sahi_iou_threshold1, slice_h1, slice_w1,
             slice_overlap1, pose_model, pose_attempts1, pose_conf_threshold1,
             pose_iou_threshold1, tracker1,
             suppress_nested=suppress_nested_detections,
             nested_contain_thresh=nested_contain_thresh,
-            nested_area_ratio=nested_area_ratio
+            nested_area_ratio=nested_area_ratio,
+            invalid_if_above_lines=invalid_view1_lines,
+            invalid_ref_pt=invalid_view1_ref_pt
         )
         detections2 = detect_view(
-            frame2, frame_id, annotations2, size, mask2, det_model,
+            frame2, frame_id, annotations2, det_model,
             sahi_conf_threshold2, sahi_iou_threshold2, slice_h2, slice_w2,
             slice_overlap2, pose_model, pose_attempts2, pose_conf_threshold2,
             pose_iou_threshold2, tracker2,
@@ -1332,69 +954,24 @@ def yolo_sahi_pose_tracking(
             detections2, frame_id, finalize=True,
             resolve_conflicts=(frame_id not in annotations2)
         )
-        # tracklet aggregation disabled
-
-        # ===== STEP 5: CROSS-VIEW ASSOCIATION (VIEW 1 AS ANCHOR) =====
+        # ===== STEP 5: CROSS-VIEW ASSOCIATION (ONE-WAY: VIEW 1 -> VIEW 2) =====
         associate_tracks_to_view1(
             tracker1, tracker2, frame_id,
-            tracker1.cross_view_match_threshold,
-            app_weight=appearance_weight1, world_weight=world_dist_weight1,
-            max_world_dist=2000.0, world_dist_tolerance=world_dist_tolerance1,
-            reproj_max_px=reproj_max_px1, reproj_soft_margin=reproj_soft_margin1,
-            prev_assoc=prev_assoc_v2, sticky_bonus=0.10,
-            conflict_log=conflict_log, conflict_view_id=2,
-            view_id_other=2,
-            tracklet_min_frames=tracklet_min_frames,
-            tracklet_store=tracklet_store,
-            use_pose_triangulation=use_pose_triangulation,
-            pose_triangulation_max_reproj=pose_triangulation_max_reproj,
-            always_overwrite_gid=always_overwrite_gid,
-            line_sig_lines_anchor=common_lines_1,
-            line_sig_lines_other=common_lines_2,
-            line_sig_ref_anchor=line_sig_ref_1,
-            line_sig_ref_other=line_sig_ref_2,
-            line_sig_thresh=0.15,
-            line_sig_debug_frames=line_sig_debug_frames,
-            anchor_view_id=1
+            homography_anchor_to_other=h_view1_to_view2,
+            max_projected_dist_px=cross_view_max_dist_px1
         )
-        associate_tracks_to_view1(
-            tracker2, tracker1, frame_id,
-            tracker2.cross_view_match_threshold,
-            app_weight=appearance_weight2, world_weight=world_dist_weight2,
-            max_world_dist=2000.0, world_dist_tolerance=world_dist_tolerance2,
-            reproj_max_px=reproj_max_px2, reproj_soft_margin=reproj_soft_margin2,
-            prev_assoc=prev_assoc_v1, sticky_bonus=0.10,
-            conflict_log=conflict_log, conflict_view_id=1,
-            view_id_other=1,
-            tracklet_min_frames=tracklet_min_frames,
-            tracklet_store=tracklet_store,
-            use_pose_triangulation=use_pose_triangulation,
-            pose_triangulation_max_reproj=pose_triangulation_max_reproj,
-            always_overwrite_gid=always_overwrite_gid,
-            line_sig_lines_anchor=common_lines_2,
-            line_sig_lines_other=common_lines_1,
-            line_sig_ref_anchor=line_sig_ref_2,
-            line_sig_ref_other=line_sig_ref_1,
-            line_sig_thresh=0.15,
-            line_sig_debug_frames=line_sig_debug_frames,
-            anchor_view_id=2
-        )
-        if conflict_writer and conflict_log:
-            for row in conflict_log:
-                conflict_writer.writerow(row)
-            conflict_log.clear()
 
         # ===== LOG EVENTS =====
         for event in tracker1.get_frame_events():
             if 'view' not in event:
                 event['view'] = 1
-            _augment_event_with_world_pos(event, tracker1)
+            _augment_event_with_view_and_projected_pos(event, tracker1, h_view1_to_view2)
             csv_writer1.writerow(event)
         
         for event in tracker2.get_frame_events():
             if 'view' not in event:
                 event['view'] = 2
-            _augment_event_with_world_pos(event, tracker2)
+            _augment_event_with_view_and_projected_pos(event, tracker2, h_view2_to_view1)
             csv_writer2.writerow(event)
 
         # Refresh tracks after all operations
@@ -1402,11 +979,8 @@ def yolo_sahi_pose_tracking(
         tracks2 = tracker2.tracks
 
         # ===== DRAWING =====
-        roi1 = apply_trapezoid_mask(frame1, mask1)
-        roi2 = apply_trapezoid_mask(frame2, mask2)
-        if draw_court_lines_debug:
-            roi1 = draw_court_lines(roi1, line_debug1, color=(0, 255, 0), thickness=2, label=True)
-            roi2 = draw_court_lines(roi2, line_debug2, color=(0, 255, 0), thickness=2, label=True)
+        roi1 = frame1
+        roi2 = frame2
         out1 = draw_tracks(roi1.copy(), tracks1, None, connections, tracker1)
         out2 = draw_tracks(roi2.copy(), tracks2, None, connections, tracker2)
 
@@ -1422,8 +996,10 @@ def yolo_sahi_pose_tracking(
         writer1.write(out1)
         writer2.write(out2)
 
-        cv.imshow('Tracking View 1', out1)
-        cv.imshow('Tracking View 2', out2)
+        disp1 = resize_for_display(out1, max_width=size[0], max_height=size[1])
+        disp2 = resize_for_display(out2, max_width=size[0], max_height=size[1])
+        cv.imshow('Tracking View 1', disp1)
+        cv.imshow('Tracking View 2', disp2)
         
         if cv.waitKey(1) & 0xFF == ord('q'):
             break
@@ -1441,8 +1017,6 @@ def yolo_sahi_pose_tracking(
 
     csv_file1.close()
     csv_file2.close()
-    if conflict_file:
-        conflict_file.close()
 
     print("Processing complete!")
 
@@ -1452,8 +1026,8 @@ if __name__ == '__main__':
         yolo_sahi_pose_tracking(
             source1='Tracking/material4project/Rectified videos/tracking_12/out13.mp4',
             source2='Tracking/material4project/Rectified videos/tracking_12/out4.mp4',
-            calib_path1='Tracking/material4project/3D Tracking Material/camera_data_with_Rvecs/camera_data/cam_13/calib/camera_calib.json',
-            calib_path2='Tracking/material4project/3D Tracking Material/camera_data_with_Rvecs/camera_data/cam_4/calib/camera_calib.json',
+            calib_path1='Tracking/material4project/3D Tracking Material/camera_data_with_Rvecs_2ndversion/camera_data/cam_13/calib/camera_calib.json',
+            calib_path2='Tracking/material4project/3D Tracking Material/camera_data_with_Rvecs_2ndversion/camera_data/cam_4/calib/camera_calib.json',
             annotations_dir1='tracking_12.v4i.yolov11/train/labels/',
             annotations_dir2='tracking_12.v4i.yolov11/train/labels/',
             output_path1='output_view1_improved.mp4',
@@ -1461,13 +1035,7 @@ if __name__ == '__main__':
             start_frame=1,
             enable_pose=True,
             court_lines_path1='court_lines_cam13.json',
-            court_lines_path2='court_lines_cam4.json',
             court_corners_path1='cam13_img_corners_rectified.json',
-            court_corners_path2='cam4_img_corners_rectified.json',
-            court_line_correspondence_path='court_line_corrispondency.json',
-            court_line_view1_key='line_id_cam13',
-            court_line_view2_key='line_id_cam4',
-            draw_court_lines_debug=True,
         )
     except Exception as e:
         print(f"Error during execution: {e}")

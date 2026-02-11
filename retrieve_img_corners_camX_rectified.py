@@ -4,16 +4,26 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+
+def resolve_calibration_path(cam_index: str) -> Path:
+    """Resolve calibration path used by rectified_videos.py."""
+    base = Path(r"Tracking/material4project/3D Tracking Material/camera_data_with_Rvecs_2ndversion")
+    return base / f"cam_{cam_index}" / "calib" / "camera_calib.json"
+
+
+def resolve_img_points_path(cam_index: str) -> Path:
+    """Resolve img_points path from the same camera-data root."""
+    base = Path(r"Tracking/material4project/3D Tracking Material/camera_data_with_Rvecs_2ndversion")
+    return base / f"cam_{cam_index}" / "calib" / "img_points.json"
+
+
 # Paths
 RECTIFIED_VIDEO_PATH = Path(
     r"Tracking/material4project/Rectified videos/tracking_12/out13.mp4"
 )
-CALIB_PATH = Path(
-    r"Tracking/material4project/3D Tracking Material/camera_data/cam_13/calib/camera_calib.json"
-)
-IMG_POINTS_PATH = Path(
-    r"Tracking/material4project/3D Tracking Material/camera_data_with_Rvecs/camera_data/cam_13/calib/img_points.json"
-)
+CAM_INDEX = "13"
+CALIB_PATH = resolve_calibration_path(CAM_INDEX)
+IMG_POINTS_PATH = resolve_img_points_path(CAM_INDEX)
 
 # If you only want a single frame overlay, set FRAME_INDEX to a non-negative index.
 # Set to None to process the entire video.
@@ -61,7 +71,7 @@ def remap_points_with_map(
 
         mask = np.zeros((height, width), dtype=np.uint8)
         cv2.circle(mask, (u_i, v_i), 1, 255, -1)
-        newcameramtx, _ = cv2.getOptimalNewCameraMatrix(mtx, dist, (width, height), 0.25, (width, height))
+        newcameramtx, _ = cv2.getOptimalNewCameraMatrix(mtx, dist, (width, height), 0, (width, height))
 
         grid_x, grid_y = np.meshgrid(np.arange(width), np.arange(height))
         pts = np.stack([grid_x, grid_y], axis=-1).astype(np.float32)
