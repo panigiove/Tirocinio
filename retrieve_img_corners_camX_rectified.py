@@ -6,13 +6,13 @@ import numpy as np
 
 # Paths
 RECTIFIED_VIDEO_PATH = Path(
-    r"Tracking/material4project/Rectified videos/tracking_12/out4.mp4"
+    r"Tracking/material4project/Rectified videos/tracking_12/out13.mp4"
 )
 CALIB_PATH = Path(
-    r"Tracking/material4project/3D Tracking Material/camera_data/cam_4/calib/camera_calib.json"
+    r"Tracking/material4project/3D Tracking Material/camera_data/cam_13/calib/camera_calib.json"
 )
 IMG_POINTS_PATH = Path(
-    r"Tracking/material4project/3D Tracking Material/camera_data_with_Rvecs/camera_data/cam_4/calib/img_points.json"
+    r"Tracking/material4project/3D Tracking Material/camera_data_with_Rvecs/camera_data/cam_13/calib/img_points.json"
 )
 
 # If you only want a single frame overlay, set FRAME_INDEX to a non-negative index.
@@ -20,8 +20,8 @@ IMG_POINTS_PATH = Path(
 FRAME_INDEX = None
 
 # Optional outputs
-OUTPUT_IMAGE_PATH = Path("cam4_img_corners_rectified_overlay.png")
-OUTPUT_POINTS_PATH = Path("cam4_img_corners_rectified.json")
+OUTPUT_IMAGE_PATH = Path("cam13_img_corners_rectified_overlay.png")
+OUTPUT_POINTS_PATH = Path("cam13_img_corners_rectified.json")
 
 # Display frames live
 SHOW_WINDOW = True
@@ -44,23 +44,10 @@ def load_img_corners(img_points_path: Path) -> np.ndarray:
     return np.array(img_corners, dtype=np.float32).reshape(-1, 2)
 
 
-def build_undistort_map(width: int, height: int, mtx: np.ndarray, dist: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    # Match rectified_videos.py
-    grid_x, grid_y = np.meshgrid(np.arange(width), np.arange(height))
-    pts = np.stack([grid_x, grid_y], axis=-1).astype(np.float32)
-    pts = pts.reshape(-1, 1, 2)
-
-    undistorted_pts = cv2.undistortPoints(pts, mtx, dist, P=mtx)
-    undistorted_map = undistorted_pts.reshape(height, width, 2)
-    map_x = undistorted_map[:, :, 0]
-    map_y = undistorted_map[:, :, 1]
-    return map_x, map_y
-
-
 def remap_points_with_map(
     img_corners: np.ndarray,
-    map_x: np.ndarray,
-    map_y: np.ndarray,
+    mtx: np.ndarray,
+    dist: np.ndarray,
     width: int,
     height: int,
 ) -> np.ndarray:
@@ -74,7 +61,13 @@ def remap_points_with_map(
 
         mask = np.zeros((height, width), dtype=np.uint8)
         cv2.circle(mask, (u_i, v_i), 1, 255, -1)
-        remapped = cv2.remap(mask, map_x, map_y, interpolation=cv2.INTER_NEAREST)
+        newcameramtx, _ = cv2.getOptimalNewCameraMatrix(mtx, dist, (width, height), 0.25, (width, height))
+
+        grid_x, grid_y = np.meshgrid(np.arange(width), np.arange(height))
+        pts = np.stack([grid_x, grid_y], axis=-1).astype(np.float32)
+        pts = pts.reshape(-1, 1, 2)
+        
+        remapped = cv2.undistort(mask, mtx, dist, None, newcameramtx)
         ys, xs = np.where(remapped > 0)
         if xs.size == 0:
             rectified.append([np.nan, np.nan])
@@ -105,8 +98,7 @@ def main() -> None:
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    map_x, map_y = build_undistort_map(width, height, mtx, dist)
-    rectified_corners = remap_points_with_map(img_corners, map_x, map_y, width, height)
+    rectified_corners = remap_points_with_map(img_corners, mtx, dist, width, height)
     if OUTPUT_POINTS_PATH:
         OUTPUT_POINTS_PATH.parent.mkdir(parents=True, exist_ok=True)
         payload = {

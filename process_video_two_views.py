@@ -356,6 +356,23 @@ def load_court_lines(lines_path, points_by_idx):
     return lines
 
 
+def compute_common_ref_points(points_by_idx1, points_by_idx2):
+    """
+    Compute reference points using only corners common to both views.
+    Returns (ref1, ref2) in each view's pixel space (unscaled).
+    """
+    if not points_by_idx1 or not points_by_idx2:
+        return None, None
+    common_idx = sorted(set(points_by_idx1.keys()) & set(points_by_idx2.keys()))
+    if not common_idx:
+        return None, None
+    pts1 = np.array([points_by_idx1[i] for i in common_idx], dtype=np.float32)
+    pts2 = np.array([points_by_idx2[i] for i in common_idx], dtype=np.float32)
+    if pts1.size == 0 or pts2.size == 0:
+        return None, None
+    return pts1.mean(axis=0), pts2.mean(axis=0)
+
+
 def load_line_correspondences(path, view1_key, view2_key):
     if not path or not os.path.exists(path):
         return []
@@ -383,50 +400,6 @@ def scale_lines(lines, sx, sy):
     return out
 
 
-def build_line_alignment(lines_view1, lines_view2, correspondences,
-                         samples_per_line=7, ransac_thresh=5.0):
-    if not lines_view1 or not lines_view2 or not correspondences:
-        return None
-    lines1 = {l['line_id']: l for l in lines_view1}
-    lines2 = {l['line_id']: l for l in lines_view2}
-    src_pts = []
-    dst_pts = []
-    for lid1, lid2 in correspondences:
-        l1 = lines1.get(lid1)
-        l2 = lines2.get(lid2)
-        if l1 is None or l2 is None:
-            continue
-        p1a, p1b = l1['p1'], l1['p2']
-        p2a, p2b = l2['p1'], l2['p2']
-        if samples_per_line <= 1:
-            ts = [0.5]
-        else:
-            ts = [k / float(samples_per_line - 1) for k in range(samples_per_line)]
-        for t in ts:
-            p1 = p1a * (1.0 - t) + p1b * t
-            p2 = p2a * (1.0 - t) + p2b * t
-            dst_pts.append(p1)
-            src_pts.append(p2)
-    if len(src_pts) < 3:
-        return None
-    src = np.array(src_pts, dtype=np.float32)
-    dst = np.array(dst_pts, dtype=np.float32)
-    M, _ = cv.estimateAffinePartial2D(
-        src, dst, method=cv.RANSAC, ransacReprojThreshold=ransac_thresh
-    )
-    return M
-
-
-def apply_affine(M, pt):
-    if M is None or pt is None:
-        return None
-    x, y = float(pt[0]), float(pt[1])
-    return np.array([
-        M[0, 0] * x + M[0, 1] * y + M[0, 2],
-        M[1, 0] * x + M[1, 1] * y + M[1, 2]
-    ], dtype=np.float32)
-
-
 def draw_court_lines(img, lines, color=(0, 255, 0), thickness=2, label=True):
     if img is None or not lines:
         return img
@@ -443,21 +416,31 @@ def draw_court_lines(img, lines, color=(0, 255, 0), thickness=2, label=True):
     return img
 
 
-def _point_line_distance(pt, line):
+def _signed_point_line_distance(pt, line, ref_pt=None):
+    """
+    Signed distance from point to line. If ref_pt is provided, the sign is
+    oriented so that ref_pt lies on the positive side for consistency.
+    """
     p1 = line['p1']
     p2 = line['p2']
     v = p2 - p1
-    w = p1 - pt
     denom = np.linalg.norm(v)
     if denom <= 1e-6:
         return 0.0
-    return float(abs(v[0] * w[1] - v[1] * w[0]) / denom)
+    n = np.array([-v[1], v[0]], dtype=np.float32)  # perpendicular
+    d = float(np.dot((pt - p1), n) / denom)
+    if ref_pt is not None:
+        ref_side = float(np.dot((ref_pt - p1), n))
+        if ref_side < 0:
+            d = -d
+    return d
 
 
-def _line_signature(pt, lines):
+def _line_signature(pt, lines, ref_pt=None):
     if pt is None or not lines:
         return None
-    dists = np.array([_point_line_distance(pt, l) for l in lines], dtype=np.float32)
+    dists = np.array([_signed_point_line_distance(pt, l, ref_pt=ref_pt) for l in lines],
+                     dtype=np.float32)
     norm = np.linalg.norm(dists)
     if norm <= 1e-6:
         return None
@@ -624,59 +607,6 @@ def _triangulate_world_pos(tracker1, tracker2, p1, p2, max_reproj_error=50.0):
     return p3d
 
 
-class AlignmentEstimator:
-    def __init__(self, min_pairs=50, update_every=50, max_pairs=2000):
-        self.min_pairs = min_pairs
-        self.update_every = update_every
-        self.max_pairs = max_pairs
-        self.pairs = []
-        self.scale = 1.0
-        self.rot = np.eye(2, dtype=np.float32)
-        self.trans = np.zeros(2, dtype=np.float32)
-        self.ready = False
-        self._count = 0
-
-    def add_pair(self, src_xy, dst_xy):
-        if src_xy is None or dst_xy is None:
-            return
-        self.pairs.append((np.array(src_xy[:2], dtype=np.float64),
-                           np.array(dst_xy[:2], dtype=np.float64)))
-        if len(self.pairs) > self.max_pairs:
-            self.pairs = self.pairs[-self.max_pairs:]
-        self._count += 1
-        if len(self.pairs) >= self.min_pairs and (self._count % self.update_every == 0):
-            self._fit()
-
-    def _fit(self):
-        X = np.array([p[1] for p in self.pairs], dtype=np.float64)  # dst
-        Y = np.array([p[0] for p in self.pairs], dtype=np.float64)  # src
-        muX = X.mean(axis=0)
-        muY = Y.mean(axis=0)
-        Xc = X - muX
-        Yc = Y - muY
-        H = Yc.T @ Xc
-        U, S, Vt = np.linalg.svd(H)
-        R = U @ Vt
-        if np.linalg.det(R) < 0:
-            Vt[-1, :] *= -1
-            R = U @ Vt
-        varY = (Yc ** 2).sum()
-        scale = (S.sum()) / varY if varY > 0 else 1.0
-        T = muX - scale * (R @ muY)
-        self.scale = float(scale)
-        self.rot = R.astype(np.float32)
-        self.trans = T.astype(np.float32)
-        self.ready = True
-
-    def transform(self, wp):
-        if wp is None:
-            return None
-        x, y = float(wp[0]), float(wp[1])
-        rx = self.scale * (self.rot[0][0] * x + self.rot[0][1] * y) + self.trans[0]
-        ry = self.scale * (self.rot[1][0] * x + self.rot[1][1] * y) + self.trans[1]
-        return np.array([rx, ry, 0.0], dtype=np.float32)
-
-
 class TrackletStore:
     def __init__(self):
         self.stats = {}
@@ -769,9 +699,8 @@ def associate_tracks_to_view1(tracker1, tracker_other, frame_id,
                               match_threshold, app_weight=0.4, world_weight=0.6,
                               max_world_dist=None, world_dist_tolerance=0.0,
                               reproj_max_px=120.0, reproj_soft_margin=40.0,
-                              pixel_align=None, pixel_dist_max=None,
-                              pixel_dist_soft_margin=40.0,
                               line_sig_lines_anchor=None, line_sig_lines_other=None,
+                              line_sig_ref_anchor=None, line_sig_ref_other=None,
                               line_sig_thresh=0.15,
                               line_sig_debug_frames=None,
                               prev_assoc=None, sticky_bonus=0.08,
@@ -782,7 +711,6 @@ def associate_tracks_to_view1(tracker1, tracker_other, frame_id,
                               use_pose_triangulation=True,
                               pose_triangulation_max_reproj=50.0,
                               always_overwrite_gid=False,
-                              align_estimator=None,
                               anchor_view_id=1,):
     active1 = [t for t in tracker1.tracks if t['updated']]
     active_other = [t for t in tracker_other.tracks if t['updated']]
@@ -810,11 +738,11 @@ def associate_tracks_to_view1(tracker1, tracker_other, frame_id,
         line_sigs_1 = []
         for t in active1:
             p1_px = _track_anchor_pixel(t)
-            line_sigs_1.append(_line_signature(p1_px, line_sig_lines_anchor))
+            line_sigs_1.append(_line_signature(p1_px, line_sig_lines_anchor, ref_pt=line_sig_ref_anchor))
         line_sigs_2 = []
         for t in active_other:
             p2_px = _track_anchor_pixel(t)
-            line_sigs_2.append(_line_signature(p2_px, line_sig_lines_other))
+            line_sigs_2.append(_line_signature(p2_px, line_sig_lines_other, ref_pt=line_sig_ref_other))
 
     cost = np.zeros((len(active1), len(active_other)), dtype=np.float32)
     for i, t1 in enumerate(active1):
@@ -880,12 +808,6 @@ def associate_tracks_to_view1(tracker1, tracker_other, frame_id,
                     if tri is not None:
                         wp1 = tri
                         wp2 = tri
-                        if align_estimator is not None and view_id_other == 2:
-                            # Use triangulated points as target to align view2 world positions
-                            align_estimator.add_pair(t2.get('world_pos'), tri)
-
-            if align_estimator is not None and align_estimator.ready and view_id_other == 2:
-                wp2 = align_estimator.transform(wp2)
 
             world_sim = tracker1._world_pos_sim(wp1, wp2)
             
@@ -1013,7 +935,7 @@ def yolo_sahi_pose_tracking(
     appearance_weight1=0.35,
     pose_weight1=0.0,
     ema_alpha1=0.5,
-    max_velocity1=500.0,
+    max_velocity1=800.0,
     suppress_nested_tracks1=True,
     nested_track_contain_thresh1=0.9,
     nested_track_area_ratio1=0.6,
@@ -1043,7 +965,7 @@ def yolo_sahi_pose_tracking(
     appearance_weight2=0.35,
     pose_weight2=0.0,
     ema_alpha2=0.5,
-    max_velocity2=500.0,
+    max_velocity2=800.0,
     suppress_nested_tracks2=True,
     nested_track_contain_thresh2=0.9,
     nested_track_area_ratio2=0.6,
@@ -1062,10 +984,6 @@ def yolo_sahi_pose_tracking(
     nested_contain_thresh=0.9,
     nested_area_ratio=0.6,
     always_overwrite_gid=True,
-    align_from_triangulation=True,
-    align_min_pairs=50,
-    align_update_every=50,
-    align_max_pairs=2000,
     # line-based alignment + debug
     court_lines_path1=None,
     court_lines_path2=None,
@@ -1075,10 +993,6 @@ def yolo_sahi_pose_tracking(
     court_line_view1_key='line_id_cam13',
     court_line_view2_key='line_id_cam4',
     draw_court_lines_debug=True,
-    align_pixel_max_dist=120.0,
-    align_pixel_soft_margin=40.0,
-    align_pixel_samples=7,
-    align_pixel_ransac_thresh=5.0,
     line_sig_debug_frames=(12,),
     # logging
     conflict_log_path='annotation_conflicts.csv'
@@ -1162,13 +1076,6 @@ def yolo_sahi_pose_tracking(
         nested_app_sim_thresh=nested_track_app_sim2
     )
 
-    align_estimator = None
-    if align_from_triangulation:
-        align_estimator = AlignmentEstimator(
-            min_pairs=align_min_pairs,
-            update_every=align_update_every,
-            max_pairs=align_max_pairs
-        )
     tracklet_store = None
 
     # Open videos
@@ -1247,8 +1154,8 @@ def yolo_sahi_pose_tracking(
     line_debug2 = []
     common_lines_1 = []
     common_lines_2 = []
-    pixel_align_21 = None
-    pixel_align_12 = None
+    line_sig_ref_1 = None
+    line_sig_ref_2 = None
     if court_lines_path1 and court_lines_path2 and court_corners_path1 and court_corners_path2 and court_line_correspondence_path:
         sx1 = size[0] / float(orig_w1) if orig_w1 > 0 else 1.0
         sy1 = size[1] / float(orig_h1) if orig_h1 > 0 else 1.0
@@ -1261,6 +1168,11 @@ def yolo_sahi_pose_tracking(
         lines2 = load_court_lines(court_lines_path2, pts2)
         line_debug1 = scale_lines(lines1, sx1, sy1)
         line_debug2 = scale_lines(lines2, sx2, sy2)
+        ref1, ref2 = compute_common_ref_points(pts1, pts2)
+        if ref1 is not None:
+            line_sig_ref_1 = np.array([ref1[0] * sx1, ref1[1] * sy1], dtype=np.float32)
+        if ref2 is not None:
+            line_sig_ref_2 = np.array([ref2[0] * sx2, ref2[1] * sy2], dtype=np.float32)
 
         corr = load_line_correspondences(
             court_line_correspondence_path, court_line_view1_key, court_line_view2_key
@@ -1273,14 +1185,6 @@ def yolo_sahi_pose_tracking(
             if l1 is not None and l2 is not None:
                 common_lines_1.append(l1)
                 common_lines_2.append(l2)
-        pixel_align_21 = build_line_alignment(
-            line_debug1, line_debug2, corr,
-            samples_per_line=align_pixel_samples,
-            ransac_thresh=align_pixel_ransac_thresh
-        )
-        if pixel_align_21 is not None:
-            pixel_align_12 = cv.invertAffineTransform(pixel_align_21)
-
     initial_detections1 = detect_view(
         frame1, frame_id, annotations1, size, mask1, det_model,
         sahi_conf_threshold1, sahi_iou_threshold1, slice_h1, slice_w1,
@@ -1327,12 +1231,10 @@ def yolo_sahi_pose_tracking(
         use_pose_triangulation=use_pose_triangulation,
         pose_triangulation_max_reproj=pose_triangulation_max_reproj,
         always_overwrite_gid=always_overwrite_gid,
-        align_estimator=align_estimator,
-        pixel_align=None,
-        pixel_dist_max=None,
-        pixel_dist_soft_margin=align_pixel_soft_margin,
         line_sig_lines_anchor=common_lines_1,
         line_sig_lines_other=common_lines_2,
+        line_sig_ref_anchor=line_sig_ref_1,
+        line_sig_ref_other=line_sig_ref_2,
         line_sig_thresh=0.15,
         line_sig_debug_frames=line_sig_debug_frames,
         anchor_view_id=1,
@@ -1351,12 +1253,10 @@ def yolo_sahi_pose_tracking(
         use_pose_triangulation=use_pose_triangulation,
         pose_triangulation_max_reproj=pose_triangulation_max_reproj,
         always_overwrite_gid=always_overwrite_gid,
-        align_estimator=align_estimator,
-        pixel_align=None,
-        pixel_dist_max=None,
-        pixel_dist_soft_margin=align_pixel_soft_margin,
         line_sig_lines_anchor=common_lines_2,
         line_sig_lines_other=common_lines_1,
+        line_sig_ref_anchor=line_sig_ref_2,
+        line_sig_ref_other=line_sig_ref_1,
         line_sig_thresh=0.15,
         line_sig_debug_frames=line_sig_debug_frames,
         anchor_view_id=2
@@ -1449,12 +1349,10 @@ def yolo_sahi_pose_tracking(
             use_pose_triangulation=use_pose_triangulation,
             pose_triangulation_max_reproj=pose_triangulation_max_reproj,
             always_overwrite_gid=always_overwrite_gid,
-            align_estimator=align_estimator,
-            pixel_align=None,
-            pixel_dist_max=None,
-            pixel_dist_soft_margin=align_pixel_soft_margin,
             line_sig_lines_anchor=common_lines_1,
             line_sig_lines_other=common_lines_2,
+            line_sig_ref_anchor=line_sig_ref_1,
+            line_sig_ref_other=line_sig_ref_2,
             line_sig_thresh=0.15,
             line_sig_debug_frames=line_sig_debug_frames,
             anchor_view_id=1
@@ -1473,12 +1371,10 @@ def yolo_sahi_pose_tracking(
             use_pose_triangulation=use_pose_triangulation,
             pose_triangulation_max_reproj=pose_triangulation_max_reproj,
             always_overwrite_gid=always_overwrite_gid,
-            align_estimator=align_estimator,
-            pixel_align=None,
-            pixel_dist_max=None,
-            pixel_dist_soft_margin=align_pixel_soft_margin,
             line_sig_lines_anchor=common_lines_2,
             line_sig_lines_other=common_lines_1,
+            line_sig_ref_anchor=line_sig_ref_2,
+            line_sig_ref_other=line_sig_ref_1,
             line_sig_thresh=0.15,
             line_sig_debug_frames=line_sig_debug_frames,
             anchor_view_id=2
@@ -1556,8 +1452,8 @@ if __name__ == '__main__':
         yolo_sahi_pose_tracking(
             source1='Tracking/material4project/Rectified videos/tracking_12/out13.mp4',
             source2='Tracking/material4project/Rectified videos/tracking_12/out4.mp4',
-            calib_path1='Tracking/material4project/3D Tracking Material/camera_data_with_Rvecs/camera_data/cam_13/calib/camera_calib_real.json',
-            calib_path2='Tracking/material4project/3D Tracking Material/camera_data_with_Rvecs/camera_data/cam_4/calib/camera_calib_real.json',
+            calib_path1='Tracking/material4project/3D Tracking Material/camera_data_with_Rvecs/camera_data/cam_13/calib/camera_calib.json',
+            calib_path2='Tracking/material4project/3D Tracking Material/camera_data_with_Rvecs/camera_data/cam_4/calib/camera_calib.json',
             annotations_dir1='tracking_12.v4i.yolov11/train/labels/',
             annotations_dir2='tracking_12.v4i.yolov11/train/labels/',
             output_path1='output_view1_improved.mp4',

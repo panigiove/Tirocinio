@@ -29,19 +29,6 @@ def load_calibration(calib_path: Path) -> tuple[np.ndarray, np.ndarray]:
     dist = np.array(calib["dist"], dtype=np.float32)
     return mtx, dist
 
-
-def build_undistort_map(width: int, height: int, mtx: np.ndarray, dist: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    grid_x, grid_y = np.meshgrid(np.arange(width), np.arange(height))
-    pts = np.stack([grid_x, grid_y], axis=-1).astype(np.float32)
-    pts = pts.reshape(-1, 1, 2)
-
-    undistorted_pts = cv2.undistortPoints(pts, mtx, dist, P=mtx)
-    undistorted_map = undistorted_pts.reshape(height, width, 2)
-    map_x = undistorted_map[:, :, 0]
-    map_y = undistorted_map[:, :, 1]
-    return map_x, map_y
-
-
 def rectified_output_path(in_path: Path, out_dir: Path) -> Path:
     return out_dir / in_path.name
 
@@ -68,7 +55,6 @@ def main() -> None:
         raise FileNotFoundError(f"No images found in {INPUT_DIR} with glob {IMAGE_GLOB}")
 
     # Build maps per camera key and image size
-    maps = {}
 
     for idx, img_path in enumerate(image_paths, start=1):
         cam_key = _pick_cam_key(img_path.name)
@@ -81,13 +67,15 @@ def main() -> None:
             continue
 
         height, width = img.shape[:2]
-        map_key = (cam_key, width, height)
-        if map_key not in maps:
-            mtx, dist = load_calibration(CALIB_PATHS[cam_key])
-            maps[map_key] = build_undistort_map(width, height, mtx, dist)
-        map_x, map_y = maps[map_key]
+        
+        mtx, dist = load_calibration(CALIB_PATHS[cam_key])
+        
+        grid_x, grid_y = np.meshgrid(np.arange(width), np.arange(height))
+        pts = np.stack([grid_x, grid_y], axis=-1).astype(np.float32)
+        pts = pts.reshape(-1, 1, 2)
 
-        rectified = cv2.remap(img, map_x, map_y, interpolation=cv2.INTER_LINEAR)
+        newcameramtx, roi = cv2.getOptimalNewCameraMatrix(mtx, dist, (width, height), 0.25, (width, height))
+        rectified = cv2.undistort(img, mtx, dist, None, newcameramtx)
         out_path = rectified_output_path(img_path, OUTPUT_DIR)
         cv2.imwrite(str(out_path), rectified)
 

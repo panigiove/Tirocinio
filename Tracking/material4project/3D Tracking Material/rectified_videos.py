@@ -32,24 +32,20 @@ def process_video(video_path, calib_path, output_path):
     grid_x, grid_y = np.meshgrid(np.arange(width), np.arange(height))
     pts = np.stack([grid_x, grid_y], axis=-1).astype(np.float32)
     pts = pts.reshape(-1, 1, 2)
-    
 
-    undistorted_pts = cv2.undistortPoints(pts, mtx, dist, P=mtx)
-    undistorted_map = undistorted_pts.reshape(height, width, 2)
-    map_x = undistorted_map[:, :, 0]
-    map_y = undistorted_map[:, :, 1]
     
     frame_count = 0
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-        # Apply the undistortion map to the frame
-        rectified_frame = cv2.remap(frame, map_x, map_y, interpolation=cv2.INTER_LINEAR)
-        out.write(rectified_frame)
+        
+        h, w = frame.shape[:2]
+        newcameramtx, roi = cv2.getOptimalNewCameraMatrix(mtx, dist, (w, h), 0.25, (w, h))
+        undistorted_frame = cv2.undistort(frame, mtx, dist, None, newcameramtx)
+        out.write(undistorted_frame)
         frame_count += 1
-        if frame_count % 50 == 0:
-            print(f"Processed {frame_count} frames for {video_path}")
+        print(f"Processed {frame_count} frame for {video_path}")
     
     cap.release()
     out.release()

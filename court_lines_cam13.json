@@ -76,11 +76,6 @@
             "end_point_index": 19
         },
         {
-            "line_id": 15,
-            "start_point_index": 10,
-            "end_point_index": 11
-        },
-        {
             "line_id": 16,
             "start_point_index": 11,
             "end_point_index": 12
@@ -139,11 +134,6 @@
             "line_id": 27,
             "start_point_index": 22,
             "end_point_index": 23
-        },
-        {
-            "line_id": 28,
-            "start_point_index": 23,
-            "end_point_index": 10
         }
     ]
 }

@@ -108,10 +108,10 @@ def xyxy_to_yolo(x1, y1, x2, y2, img_width, img_height):
     return center_x, center_y, width, height
 
 
-def rectify_bbox(bbox_xyxy, mtx, dist, img_width, img_height):
+def rectify_bbox(bbox_xyxy, mtx, dist, newcameramtx):
     """
     Rectify a bounding box using exactly the same logic as the video rectification.
-    Matches cv2.initUndistortRectifyMap(mtx, dist, None, mtx, ...) + cv2.remap
+    Matches rectified_videos.py: cv2.undistort(frame, mtx, dist, None, newcameramtx)
     """
     x1, y1, x2, y2 = bbox_xyxy
     
@@ -128,9 +128,8 @@ def rectify_bbox(bbox_xyxy, mtx, dist, img_width, img_height):
     
     all_points = np.array([edge_points], dtype=np.float32)
     
-    # Use undistortPoints with P=mtx to match initUndistortRectifyMap(mtx, dist, None, mtx, ...)
-    # R=None is identity, P=mtx matches the video rectification's newCameraMatrix
-    rectified_points = cv2.undistortPoints(all_points, mtx, dist, R=None, P=mtx)
+    # Use undistortPoints with P=newcameramtx to match cv2.undistort(..., newcameramtx)
+    rectified_points = cv2.undistortPoints(all_points, mtx, dist, R=None, P=newcameramtx)
     rectified_points = rectified_points.reshape(-1, 2)
     
     # Find the bounding box that contains all rectified points
@@ -149,10 +148,6 @@ def rectify_yolo_annotation_file(annotation_path, calib_path, original_img_width
     # Load calibration
     mtx, dist = load_calibration(calib_path)
     
-    # Flip distortion signs? 
-    # Experimentation shows that the video rectification seems to act opposite to standard undistortPoints with these coefficients.
-    dist = -dist
-    
     # Check if we need to scale the camera matrix (matches video resolution)
     # Calibration is typically for 3840x2160.
     calib_res = (3840, 2160)
@@ -164,6 +159,11 @@ def rectify_yolo_annotation_file(annotation_path, calib_path, original_img_width
         mtx[1, 1] *= sh
         mtx[1, 2] *= sh
         print(f"  Note: Scaled camera matrix for {original_img_width}x{original_img_height}")
+
+    # Match rectified_videos.py: newCameraMatrix with alpha=0.25
+    newcameramtx, _ = cv2.getOptimalNewCameraMatrix(
+        mtx, dist, (original_img_width, original_img_height), 0.25, (original_img_width, original_img_height)
+    )
 
     # Read annotations
     rectified_annotations = []
@@ -187,7 +187,7 @@ def rectify_yolo_annotation_file(annotation_path, calib_path, original_img_width
             
             # Rectify the bounding box
             rect_x1, rect_y1, rect_x2, rect_y2 = rectify_bbox(
-                (x1, y1, x2, y2), mtx, dist, original_img_width, original_img_height
+                (x1, y1, x2, y2), mtx, dist, newcameramtx
             )
             
             # Convert back to YOLO format

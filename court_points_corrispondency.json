@@ -1,0 +1,48 @@
+{
+    "rectified_img_corners_corrispondency": [
+        {
+            "point_id_cam4": 0,
+            "point_id_cam13": 0
+        },
+        {
+            "point_id_cam4": 1,
+            "point_id_cam13": 1
+        },
+        {
+            "point_id_cam4": 2,
+            "point_id_cam13": 2
+        },
+        {
+            "point_id_cam4": 3,
+            "point_id_cam13": 3
+        },
+        {
+            "point_id_cam4": 4,
+            "point_id_cam13": 4
+        },
+        {
+            "point_id_cam4": 6,
+            "point_id_cam13": 11
+        },
+        {
+            "point_id_cam4": 7,
+            "point_id_cam13": 12
+        },
+        {
+            "point_id_cam4": 8,
+            "point_id_cam13": 13
+        },
+        {
+            "point_id_cam4": 9,
+            "point_id_cam13": 14
+        },
+        {
+            "point_id_cam4": 10,
+            "point_id_cam13": 22
+        },
+        {
+            "point_id_cam4": 11,
+            "point_id_cam13": 23
+        }
+    ]
+}
