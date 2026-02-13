@@ -21,18 +21,83 @@ def iou(b1, b2):
 
 
 class GlobalIDManager:
-    def __init__(self):
+    def __init__(self, pool_size=None, gid_values=None, cooldown_frames=90):
+        self.cooldown_frames = int(max(0, cooldown_frames))
+        self._active_counts = {}
+        self._last_released_frame = {}
         self._next_id = 0
 
-    def next_id(self):
-        id_to_return = self._next_id
-        self._next_id += 1
-        return id_to_return
+        # Fixed-pool mode when pool_size/gid_values are provided.
+        self._fixed_pool = (gid_values is not None) or (pool_size is not None)
+        if self._fixed_pool:
+            if gid_values is None:
+                gid_values = list(range(int(pool_size)))
+            gids = sorted({int(g) for g in gid_values})
+            if not gids:
+                raise ValueError("GlobalIDManager requires at least one GID in the pool")
+            for gid in gids:
+                self._active_counts[gid] = 0
+                self._last_released_frame[gid] = -10**9
+            self._gids = gids
+        else:
+            self._gids = []
 
     def update_max_id(self, current_id):
-        """Update the internal counter to avoid conflicts with manually assigned IDs."""
+        """
+        Backward compatibility helper.
+        """
+        if self._fixed_pool:
+            return
+        current_id = int(current_id)
         if current_id >= self._next_id:
             self._next_id = current_id + 1
+
+    def claim_id(self, gid, frame_id=None):
+        gid = int(gid)
+        if gid not in self._active_counts:
+            if self._fixed_pool:
+                return False
+            self._active_counts[gid] = 0
+            self._last_released_frame[gid] = -10**9
+            if gid >= self._next_id:
+                self._next_id = gid + 1
+        self._active_counts[gid] += 1
+        return True
+
+    def release_id(self, gid, frame_id):
+        gid = int(gid)
+        if gid not in self._active_counts:
+            return False
+        if self._active_counts[gid] > 0:
+            self._active_counts[gid] -= 1
+        if self._active_counts[gid] == 0:
+            self._last_released_frame[gid] = int(frame_id)
+        return True
+
+    def next_id(self, frame_id=0):
+        if not self._fixed_pool:
+            gid = self._next_id
+            self._next_id += 1
+            self._active_counts[gid] = self._active_counts.get(gid, 0)
+            self._last_released_frame[gid] = self._last_released_frame.get(gid, -10**9)
+            return gid
+
+        frame_id = int(frame_id)
+        free_and_cooled = []
+        free_any = []
+
+        for gid in self._gids:
+            if self._active_counts[gid] != 0:
+                continue
+            free_any.append(gid)
+            if (frame_id - self._last_released_frame[gid]) >= self.cooldown_frames:
+                free_and_cooled.append(gid)
+
+        if free_and_cooled:
+            return min(free_and_cooled)
+
+        # Pool exhausted (all active).
+        return None
 
 
 
@@ -56,6 +121,8 @@ class IOUTracker:
                  max_velocity=1000.0,
                  global_id_manager=None,
                  is_rectified=True,  # NEW: flag for rectified videos
+                 prune_tracks=True,
+                 fixed_slots_mode=False,
                  suppress_nested_tracks=True,
                  nested_contain_thresh=0.9,
                  nested_area_ratio=0.6,
@@ -91,6 +158,8 @@ class IOUTracker:
         self.max_velocity = max_velocity
         self.id_manager = global_id_manager if global_id_manager else GlobalIDManager()
         self.is_rectified = is_rectified
+        self.prune_tracks = bool(prune_tracks)
+        self.fixed_slots_mode = bool(fixed_slots_mode)
         self.suppress_nested_tracks = suppress_nested_tracks
         self.nested_contain_thresh = nested_contain_thresh
         self.nested_area_ratio = nested_area_ratio
@@ -204,6 +273,7 @@ class IOUTracker:
                     'event': 'duplicate_suppressed',
                     'global_id': t['global_id']
                 })
+                self.id_manager.release_id(t['global_id'], frame_id)
                 if t['global_id'] in self.global_id_to_track and self.global_id_to_track[t['global_id']] is t:
                     del self.global_id_to_track[t['global_id']]
                 if t['track_id'] in self.track_to_global_id:
@@ -372,9 +442,6 @@ class IOUTracker:
                 self._update_track(existing_track, det, frame_id)
                 existing_track['updated'] = True
                 return existing_track
-            else:
-                # Sync ID manager if it's a new ID coming from outside
-                self.id_manager.update_max_id(global_id)
         
         # 2. Try to Re-ID into any MISSED track based on appearance/pose/world_pos
         best_sim = -1
@@ -402,7 +469,7 @@ class IOUTracker:
                 best_t = t
         
         # Threshold for Re-ID
-        if best_t is not None and best_sim > 0.4:
+        if best_t is not None and (best_sim > 0.4 or self.fixed_slots_mode):
             self._update_track(best_t, det, frame_id)
             best_t['updated'] = True
             return best_t
@@ -415,9 +482,20 @@ class IOUTracker:
             if global_id is None and len(self.global_id_to_track) >= self.max_tracks:
                 return None
 
-        # FIX: Allow new tracks without global_id (will be assigned by manager)
+        # FIX: Use fixed-pool GIDs with cooldown-aware allocation.
         if global_id is None:
-            global_id = self.id_manager.next_id()
+            global_id = self.id_manager.next_id(frame_id)
+            if global_id is None:
+                return None
+            if not self.id_manager.claim_id(global_id, frame_id):
+                return None
+        else:
+            global_id = int(global_id)
+            if not self.id_manager.claim_id(global_id, frame_id):
+                fallback_gid = self.id_manager.next_id(frame_id)
+                if fallback_gid is None or not self.id_manager.claim_id(fallback_gid, frame_id):
+                    return None
+                global_id = fallback_gid
             
         new_track = {
             'track_id': self.next_id,
@@ -460,7 +538,14 @@ class IOUTracker:
                 return cand
         return None
 
-    def reassign_track_global_id(self, track, new_gid, frame_id, allow_target_conflict=False):
+    def reassign_track_global_id(
+        self,
+        track,
+        new_gid,
+        frame_id,
+        allow_target_conflict=False,
+        event_name='merged_id',
+    ):
         """
         Reassign a specific track to a new global ID.
         If allow_target_conflict is False, reassignment is refused when new_gid
@@ -471,6 +556,7 @@ class IOUTracker:
 
         old_gid = track.get('global_id')
         tid = track.get('track_id')
+        new_gid = int(new_gid)
 
         if old_gid == new_gid:
             if tid is not None:
@@ -482,25 +568,37 @@ class IOUTracker:
         if occupied is not None and not allow_target_conflict:
             return False
 
-        # Optional controlled swap path (currently not used by caller).
         if occupied is not None and allow_target_conflict:
-            occupied_old_gid = occupied.get('global_id')
-            fallback_gid = old_gid
-            if fallback_gid is None or self._find_track_by_gid(fallback_gid, exclude_track=occupied) is not None:
-                fallback_gid = self.id_manager.next_id()
+            # In fixed-slot settings we often want GIDs to follow the cross-view
+            # association result, even if the target GID is currently occupied.
+            # Resolve this by swapping GIDs between the two tracks.
+            occupied_tid = occupied.get('track_id')
+            occupied_gid = occupied.get('global_id')
 
-            if occupied_old_gid in self.global_id_to_track and self.global_id_to_track[occupied_old_gid] is occupied:
-                del self.global_id_to_track[occupied_old_gid]
-            occupied['global_id'] = fallback_gid
-            self.track_to_global_id[occupied['track_id']] = fallback_gid
-            self.global_id_to_track[fallback_gid] = occupied
+            track['global_id'] = new_gid
+            if tid is not None:
+                self.track_to_global_id[tid] = new_gid
+            self.global_id_to_track[new_gid] = track
+
+            if occupied_gid is not None:
+                occupied['global_id'] = old_gid
+                if occupied_tid is not None:
+                    self.track_to_global_id[occupied_tid] = old_gid
+                if old_gid is not None:
+                    self.global_id_to_track[old_gid] = occupied
+
             self.current_frame_events.append({
                 'frame': frame_id,
-                'track_id': occupied['track_id'],
-                'event': 'gid_conflict_resolved',
-                'old_global_id': occupied_old_gid,
-                'new_global_id': fallback_gid
+                'track_id': tid,
+                'event': event_name,
+                'old_global_id': old_gid,
+                'new_global_id': new_gid,
+                'swapped_with_track_id': occupied_tid
             })
+            return True
+
+        if not self.id_manager.claim_id(new_gid, frame_id):
+            return False
 
         if old_gid in self.global_id_to_track and self.global_id_to_track[old_gid] is track:
             del self.global_id_to_track[old_gid]
@@ -509,11 +607,13 @@ class IOUTracker:
         if tid is not None:
             self.track_to_global_id[tid] = new_gid
         self.global_id_to_track[new_gid] = track
+        if old_gid is not None:
+            self.id_manager.release_id(old_gid, frame_id)
 
         self.current_frame_events.append({
             'frame': frame_id,
             'track_id': tid,
-            'event': 'merged_id',
+            'event': event_name,
             'old_global_id': old_gid,
             'new_global_id': new_gid
         })
@@ -558,22 +658,18 @@ class IOUTracker:
             keeper = tracks_sorted[0]
 
             for t in tracks_sorted[1:]:
-                new_gid = self.id_manager.next_id()
-                old_gid = t['global_id']
-                t['global_id'] = new_gid
-                t['gid_source'] = None
-                self.track_to_global_id[t['track_id']] = new_gid
-                if old_gid in self.global_id_to_track and self.global_id_to_track[old_gid] is t:
-                    del self.global_id_to_track[old_gid]
-                self.global_id_to_track[new_gid] = t
-
-                self.current_frame_events.append({
-                    'frame': frame_id,
-                    'track_id': t['track_id'],
-                    'event': 'gid_conflict_resolved',
-                    'old_global_id': old_gid,
-                    'new_global_id': new_gid
-                })
+                new_gid = self.id_manager.next_id(frame_id)
+                if new_gid is None:
+                    continue
+                moved = self.reassign_track_global_id(
+                    t,
+                    new_gid,
+                    frame_id,
+                    allow_target_conflict=False,
+                    event_name='gid_conflict_resolved',
+                )
+                if moved:
+                    t['gid_source'] = None
 
             # Ensure keeper mapping is correct
             self.global_id_to_track[keeper['global_id']] = keeper
@@ -635,6 +731,7 @@ class IOUTracker:
                     'global_id': t['global_id']
                 })
                 self.current_frame_statistics['lost_tracks'] += 1
+                self.id_manager.release_id(t['global_id'], frame_id)
                 # Remove from global_id mappings if the track is truly lost
                 if t['global_id'] in self.global_id_to_track:
                     del self.global_id_to_track[t['global_id']]
@@ -683,7 +780,7 @@ class IOUTracker:
         if len(detections) == 0:
             for t in self.tracks:
                 t['missed'] += 1
-                if t['missed'] > 0 and t['missed'] <= self.max_missed:
+                if t['missed'] > 0 and (not self.prune_tracks or t['missed'] <= self.max_missed):
                     self.current_frame_events.append({
                         'frame': frame_id, 
                         'track_id': t['track_id'], 
@@ -692,7 +789,8 @@ class IOUTracker:
                     })
                     self.current_frame_statistics['temporary_missed_tracks'] += 1
                     self.total_temporary_missed_frames += 1
-            self._prune(frame_id)
+            if self.prune_tracks:
+                self._prune(frame_id)
             self.current_frame_statistics['active_tracks'] = len(self.tracks)
             self.total_active_tracks = len(self.tracks)
             return self.tracks, [], detections
@@ -715,7 +813,7 @@ class IOUTracker:
         for i, t in enumerate(self.tracks):
             if i not in matched_tracks_indices:
                 t['missed'] += 1
-                if t['missed'] > 0 and t['missed'] <= self.max_missed:
+                if t['missed'] > 0 and (not self.prune_tracks or t['missed'] <= self.max_missed):
                     self.current_frame_events.append({
                         'frame': frame_id, 
                         'track_id': t['track_id'], 
@@ -741,7 +839,8 @@ class IOUTracker:
 
         if resolve_conflicts:
             self.resolve_gid_conflicts(frame_id)
-        self._prune(frame_id)
+        if self.prune_tracks:
+            self._prune(frame_id)
         
         self.current_frame_statistics['active_tracks'] = len(self.tracks)
         self.total_active_tracks = len(self.tracks)

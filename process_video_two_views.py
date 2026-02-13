@@ -6,11 +6,11 @@ from ultralytics import YOLO
 from sahi.predict import get_sliced_prediction
 from sahi import AutoDetectionModel
 import csv
-from scipy.optimize import linear_sum_assignment
 
 import json
 import os
 import re
+from scipy.optimize import linear_sum_assignment
 
 from iou_tracker import IOUTracker, GlobalIDManager
 from appearence_utils import compute_team_appearence, keypoints_to_pose_vec
@@ -172,12 +172,50 @@ def load_annotations_from_dir(annotations_dir, video_prefix):
     return annotations
 
 
-def _min_annotated_frame(*annotations_sets):
-    frames = []
-    for ann in annotations_sets:
-        if ann:
-            frames.extend(list(ann.keys()))
-    return min(frames) if frames else None
+def _count_valid_yolo_boxes(anno_files):
+    total = 0
+    for anno_path in anno_files or []:
+        if not anno_path or not os.path.exists(anno_path):
+            continue
+        try:
+            with open(anno_path, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 5:
+                        total += 1
+        except Exception:
+            continue
+    return total
+
+
+def infer_slot_count_from_first_annotation_frame(annotations):
+    if not annotations:
+        return None, None
+    first_frame = min(annotations.keys())
+    count = _count_valid_yolo_boxes(annotations.get(first_frame, []))
+    if count <= 0:
+        return first_frame, None
+    return first_frame, int(count)
+
+
+def first_annotation_frame(annotations):
+    if not annotations:
+        return None
+    return min(annotations.keys())
+
+
+def keep_annotation_gids_only_on_initial_frame(detections, frame_id, initial_annotation_frame):
+    """
+    Keep annotation-provided global IDs only on the first annotated frame.
+    For subsequent annotated frames, keep boxes but drop annotation GID forcing.
+    """
+    if initial_annotation_frame is None or frame_id == initial_annotation_frame:
+        return detections
+    for d in detections:
+        if d.get('gid_source') == 'annotation':
+            d['gid_source'] = None
+            d['global_id'] = None
+    return detections
 
 
 def draw_tracks(img, tracks, max_tracks, connections, tracker_self):
@@ -224,7 +262,75 @@ def draw_tracks(img, tracks, max_tracks, connections, tracker_self):
 
     return img
 
-def _augment_event_with_view_and_projected_pos(event, tracker, homography_to_other):
+def draw_cross_view_associations(img, associations, view_id):
+    """Draw projected/native point pairs for cross-view matches."""
+    if img is None or not associations:
+        return img
+
+    for assoc in associations:
+        gid = assoc.get('global_id')
+        if gid is None:
+            continue
+        col = (gid * 37 % 255, gid * 17 % 255, gid * 97 % 255)
+
+        if view_id == 1:
+            native = assoc.get('native_view1')
+            projected = assoc.get('projected_view1')
+        else:
+            native = assoc.get('native_view2')
+            projected = assoc.get('projected_view2')
+
+        native_valid = native is not None and np.all(np.isfinite(native))
+        proj_valid = projected is not None and np.all(np.isfinite(projected))
+
+        if native_valid:
+            nx, ny = int(round(float(native[0]))), int(round(float(native[1])))
+            cv.circle(img, (nx, ny), 4, col, -1)
+            cv.circle(img, (nx, ny), 5, (255, 255, 255), 1)
+        if proj_valid:
+            px, py = int(round(float(projected[0]))), int(round(float(projected[1])))
+            cv.drawMarker(
+                img, (px, py), col,
+                markerType=cv.MARKER_TILTED_CROSS,
+                markerSize=10,
+                thickness=2
+            )
+            cv.putText(
+                img, f'P{gid}', (px + 6, py - 6),
+                cv.FONT_HERSHEY_SIMPLEX, 0.4, col, 1
+            )
+        if native_valid and proj_valid:
+            cv.line(img, (nx, ny), (px, py), col, 1)
+
+    return img
+
+
+def _build_association_lookup(associations):
+    """Build per-track lookups for event logging in each view."""
+    by_view1_track = {}
+    by_view2_track = {}
+    for assoc in associations or []:
+        tid1 = assoc.get('track_id_view1')
+        tid2 = assoc.get('track_id_view2')
+        dist = assoc.get('distance_px')
+        if tid1 is not None:
+            by_view1_track[tid1] = {
+                'other_track_id': tid2,
+                'projected_other_pt': assoc.get('projected_view2'),
+                'native_other_pt': assoc.get('native_view2'),
+                'distance_px': dist,
+            }
+        if tid2 is not None:
+            by_view2_track[tid2] = {
+                'other_track_id': tid1,
+                'projected_other_pt': assoc.get('projected_view1'),
+                'native_other_pt': assoc.get('native_view1'),
+                'distance_px': dist,
+            }
+    return by_view1_track, by_view2_track
+
+
+def _augment_event_with_view_and_projected_pos(event, tracker, homography_to_other, association_info_by_track=None):
     """Attach own-view bottom center and projected point in the other view."""
     event['view_x'] = ''
     event['view_y'] = ''
@@ -234,6 +340,16 @@ def _augment_event_with_view_and_projected_pos(event, tracker, homography_to_oth
     event['projected_other_y'] = ''
     event['projected_other_pos_json'] = ''
     event['has_projected_other_pos'] = 0
+    event['matched_with_other_view_track_id'] = ''
+    event['assoc_projected_other_x'] = ''
+    event['assoc_projected_other_y'] = ''
+    event['assoc_projected_other_pos_json'] = ''
+    event['has_assoc_projected_other_pos'] = 0
+    event['assoc_native_other_x'] = ''
+    event['assoc_native_other_y'] = ''
+    event['assoc_native_other_pos_json'] = ''
+    event['has_assoc_native_other_pos'] = 0
+    event['assoc_match_dist_px'] = ''
 
     if tracker is None:
         return event
@@ -241,6 +357,27 @@ def _augment_event_with_view_and_projected_pos(event, tracker, homography_to_oth
     tid = event.get('track_id')
     if tid is None:
         return event
+
+    assoc = (association_info_by_track or {}).get(tid)
+    if assoc is not None:
+        if assoc.get('other_track_id') is not None:
+            event['matched_with_other_view_track_id'] = int(assoc['other_track_id'])
+        proj_other = assoc.get('projected_other_pt')
+        if proj_other is not None and np.all(np.isfinite(proj_other)):
+            px, py = float(proj_other[0]), float(proj_other[1])
+            event['assoc_projected_other_x'] = px
+            event['assoc_projected_other_y'] = py
+            event['assoc_projected_other_pos_json'] = json.dumps([px, py])
+            event['has_assoc_projected_other_pos'] = 1
+        native_other = assoc.get('native_other_pt')
+        if native_other is not None and np.all(np.isfinite(native_other)):
+            nx, ny = float(native_other[0]), float(native_other[1])
+            event['assoc_native_other_x'] = nx
+            event['assoc_native_other_y'] = ny
+            event['assoc_native_other_pos_json'] = json.dumps([nx, ny])
+            event['has_assoc_native_other_pos'] = 1
+        if assoc.get('distance_px') is not None:
+            event['assoc_match_dist_px'] = float(assoc['distance_px'])
 
     track = next((t for t in tracker.tracks if t.get('track_id') == tid), None)
     bbox = track.get('bbox') if track else None
@@ -550,13 +687,13 @@ def detect_view(frame, frame_id, annotations, det_model,
     return detections
 
 
-def merge_track_global_id(tracker, track, target_gid, frame_id):
+def merge_track_global_id(tracker, track, target_gid, frame_id, allow_target_conflict=False):
     if track['global_id'] == target_gid:
         return True
     if hasattr(tracker, 'reassign_track_global_id'):
         return bool(
             tracker.reassign_track_global_id(
-                track, target_gid, frame_id, allow_target_conflict=False
+                track, target_gid, frame_id, allow_target_conflict=allow_target_conflict
             )
         )
     tracker.merge_global_ids(track['global_id'], target_gid, frame_id)
@@ -571,31 +708,58 @@ def _bbox_bottom_center(bbox):
 def associate_tracks_to_view1(
     tracker1, tracker_other, frame_id,
     homography_anchor_to_other,
+    homography_other_to_anchor=None,
     max_projected_dist_px=120.0,
+    sticky_gid_by_other_track=None,
 ):
-    active1 = [t for t in tracker1.tracks if t.get('updated') and t.get('bbox') is not None]
-    active_other = [t for t in tracker_other.tracks if t.get('updated') and t.get('bbox') is not None]
+    # Consider every non-lost track so cross-view GID assignment can run every frame.
+    max_missed_1 = int(getattr(tracker1, 'max_missed', 0))
+    max_missed_other = int(getattr(tracker_other, 'max_missed', 0))
+    active1 = [
+        t for t in tracker1.tracks
+        if t.get('bbox') is not None and t.get('missed', 0) <= max_missed_1
+    ]
+    active_other = [
+        t for t in tracker_other.tracks
+        if t.get('bbox') is not None and t.get('missed', 0) <= max_missed_other
+    ]
     if not active1 or not active_other:
-        return
+        return []
 
-    projected = []
+    active1 = sorted(active1, key=lambda t: t.get('track_id', 10**9))
+    active_other = sorted(active_other, key=lambda t: t.get('track_id', 10**9))
+
+    projected_to_other = []
+    native_view1 = []
     for t1 in active1:
-        p1 = _bbox_bottom_center(t1['bbox'])
-        p_other = project_point_with_homography(p1, homography_anchor_to_other)
-        projected.append(p_other)
+        native_pt = _bbox_bottom_center(t1['bbox'])
+        native_view1.append(native_pt)
+        projected_to_other.append(project_point_with_homography(native_pt, homography_anchor_to_other))
+    native_view2 = [_bbox_bottom_center(t2['bbox']) for t2 in active_other]
 
-    other_points = [_bbox_bottom_center(t2['bbox']) for t2 in active_other]
+    n1 = len(active1)
+    n2 = len(active_other)
+    very_large = float(max_projected_dist_px) + 1e6
+    cost = np.full((n1, n2), very_large, dtype=np.float32)
 
-    large = 1e9
-    cost = np.full((len(active1), len(active_other)), large, dtype=np.float32)
-    for i, p_proj in enumerate(projected):
-        if not np.all(np.isfinite(p_proj)):
+    for i, p_proj in enumerate(projected_to_other):
+        if p_proj is None or not np.all(np.isfinite(p_proj)):
             continue
-        for j, p_other in enumerate(other_points):
-            cost[i, j] = float(np.linalg.norm(p_proj - p_other))
+        gid1 = active1[i].get('global_id')
+        for j, p_other in enumerate(native_view2):
+            if p_other is None or not np.all(np.isfinite(p_other)):
+                continue
+            other_tid = active_other[j].get('track_id')
+            if sticky_gid_by_other_track is not None and other_tid is not None:
+                locked_gid = sticky_gid_by_other_track.get(other_tid)
+                if locked_gid is not None and locked_gid != gid1:
+                    continue
+            dist = float(np.linalg.norm(p_proj - p_other))
+            if dist <= max_projected_dist_px:
+                cost[i, j] = dist
 
     row_ind, col_ind = linear_sum_assignment(cost)
-
+    associations = []
     for r, c in zip(row_ind, col_ind):
         dist = float(cost[r, c])
         if dist > max_projected_dist_px:
@@ -603,13 +767,42 @@ def associate_tracks_to_view1(
 
         t1 = active1[r]
         t2 = active_other[c]
-
         gid1 = t1['global_id']
+        other_tid = t2.get('track_id')
+
         target_gid = gid1
-        merged1 = merge_track_global_id(tracker1, t1, target_gid, frame_id)
-        merged2 = merge_track_global_id(tracker_other, t2, target_gid, frame_id)
-        if merged1 and merged2 and t1.get('gid_source') == 'annotation':
+        merged1 = merge_track_global_id(
+            tracker1, t1, target_gid, frame_id, allow_target_conflict=True
+        )
+        merged2 = merge_track_global_id(
+            tracker_other, t2, target_gid, frame_id, allow_target_conflict=True
+        )
+        if not (merged1 and merged2):
+            continue
+
+        if sticky_gid_by_other_track is not None and other_tid is not None:
+            sticky_gid_by_other_track[other_tid] = target_gid
+        if t1.get('gid_source') == 'annotation':
             t2['gid_source'] = 'annotation'
+
+        p2 = projected_to_other[r]
+        n1_pt = native_view1[r]
+        n2_pt = native_view2[c]
+        p1 = None
+        if homography_other_to_anchor is not None and n2_pt is not None and np.all(np.isfinite(n2_pt)):
+            p1 = project_point_with_homography(n2_pt, homography_other_to_anchor)
+
+        associations.append({
+            'track_id_view1': t1.get('track_id'),
+            'track_id_view2': t2.get('track_id'),
+            'global_id': target_gid,
+            'native_view1': n1_pt,
+            'projected_view1': p1,
+            'native_view2': n2_pt,
+            'projected_view2': p2,
+            'distance_px': dist,
+        })
+    return associations
 
 
 def yolo_sahi_pose_tracking(
@@ -623,13 +816,11 @@ def yolo_sahi_pose_tracking(
     output_path2='output_view2.mp4',
     output_csv_path1='track_events_view1.csv',
     output_csv_path2='track_events_view2.csv',
-    start_frame=0,
-    auto_start_from_annotations=True,
     enable_pose=True,
     size=(1440, 810),  # Processing resolution (display uses same max size).
     # detection View 1
-    sahi_conf_threshold1=0.40,
-    sahi_iou_threshold1=0.40,
+    sahi_conf_threshold1=0.43,
+    sahi_iou_threshold1=0.37,
     slice_h1=480,
     slice_w1=480,
     slice_overlap1=0.3,
@@ -642,23 +833,23 @@ def yolo_sahi_pose_tracking(
     ),
     # tracker View 1
     match_threshold1=0.45,
-    iou_weight1=0.50,
+    iou_weight1=0.55,
     appearance_weight1=0.35,
-    pose_weight1=0.0,
+    pose_weight1=0.25,
     ema_alpha1=0.5,
-    max_velocity1=500.0,
-    suppress_nested_tracks1=True,
+    max_velocity1=200.0,
+    suppress_nested_tracks1=False,
     nested_track_contain_thresh1=0.9,
     nested_track_area_ratio1=0.6,
     nested_track_app_sim1=0.7,
     cross_view_max_dist_px1=120.0,
     max_missed_frames1=80,
     # detection View 2
-    sahi_conf_threshold2=0.75,
-    sahi_iou_threshold2=0.50,
+    sahi_conf_threshold2=0.55,
+    sahi_iou_threshold2=0.35,
     slice_h2=640,
     slice_w2=640,
-    slice_overlap2=0.05,
+    slice_overlap2=0.15,
     # pose View 2
     pose_conf_threshold2=0.15,
     pose_iou_threshold2=0.02,
@@ -667,22 +858,25 @@ def yolo_sahi_pose_tracking(
         {'pad': 0.25, 'conf': 0.01, 'iou': 0.005},
     ),
     # tracker View 2
-    match_threshold2=0.35,
-    iou_weight2=0.45,
+    match_threshold2=0.45,
+    iou_weight2=0.55,
     appearance_weight2=0.35,
-    pose_weight2=0.0,
+    pose_weight2=0.05,
     ema_alpha2=0.5,
-    max_velocity2=500.0,
-    suppress_nested_tracks2=True,
+    max_velocity2=300.0,
     nested_track_contain_thresh2=0.9,
-    nested_track_area_ratio2=0.68,
+    nested_track_area_ratio2=0.6,
     nested_track_app_sim2=0.7,
-    cross_view_max_dist_px2=120.0,
     max_missed_frames2=80,
     homography_path='homography_cam4_to_cam13.json',
-    suppress_nested_detections=True,
     nested_contain_thresh=0.9,
     nested_area_ratio=0.68,
+    gid_pool_size=None,
+    gid_reuse_cooldown_frames=0,
+    sticky_cross_view_gid_lock=False,
+    fixed_slots_mode=False,
+    fixed_slots_count=None,
+    annotation_gid_first_frame_only=True,
     # line-based filtering + debug
     invalid_view1_line_ids=(12, 13, 14),
     court_lines_path1=None,
@@ -724,7 +918,47 @@ def yolo_sahi_pose_tracking(
     video_prefix1 = os.path.basename(source1).split('.')[0] if source1 else None
     video_prefix2 = os.path.basename(source2).split('.')[0] if source2 else None
 
-    shared_id_manager = GlobalIDManager()
+    # Load annotations early so fixed-slot initialization can infer roster size.
+    annotations1 = load_annotations_from_dir(annotations_dir1, video_prefix1)
+    annotations2 = load_annotations_from_dir(annotations_dir2, video_prefix2)
+    initial_annotation_frame1 = first_annotation_frame(annotations1)
+    initial_annotation_frame2 = first_annotation_frame(annotations2)
+    if annotation_gid_first_frame_only:
+        print(
+            f"Annotation GID init-only mode: view1 first frame={initial_annotation_frame1}, "
+            f"view2 first frame={initial_annotation_frame2}"
+        )
+
+    if fixed_slots_mode:
+        slot_count = fixed_slots_count
+        if slot_count is None:
+            first_frame1, inferred1 = infer_slot_count_from_first_annotation_frame(annotations1)
+            if inferred1 is not None:
+                slot_count = inferred1
+                print(f"Fixed slots inferred from view1 frame {first_frame1}: {slot_count}")
+            else:
+                first_frame2, inferred2 = infer_slot_count_from_first_annotation_frame(annotations2)
+                if inferred2 is not None:
+                    slot_count = inferred2
+                    print(f"Fixed slots inferred from view2 frame {first_frame2}: {slot_count}")
+        if slot_count is None or int(slot_count) <= 0:
+            raise ValueError(
+                "fixed_slots_mode=True requires fixed_slots_count or valid first-frame annotations."
+            )
+        fixed_slots_count = int(slot_count)
+        print(f"Fixed slots mode enabled: {fixed_slots_count} slots per view")
+    else:
+        fixed_slots_count = None
+
+    if gid_pool_size is None:
+        # Unlimited GID mode: do not use fixed-pool allocation/cooldown.
+        shared_id_manager = GlobalIDManager()
+    else:
+        shared_id_manager = GlobalIDManager(
+            pool_size=gid_pool_size,
+            cooldown_frames=max(0, int(gid_reuse_cooldown_frames)),
+        )
+    sticky_gid_view2 = {} if sticky_cross_view_gid_lock else None
 
     # FIX: Create trackers with unified max_missed_frames and is_rectified=True
     tracker1 = IOUTracker(
@@ -737,8 +971,12 @@ def yolo_sahi_pose_tracking(
         max_velocity=max_velocity1,
         camera_params=calib1,
         global_id_manager=shared_id_manager,
+        max_tracks=fixed_slots_count,
         is_rectified=True,  # FIX: Videos are rectified
-        suppress_nested_tracks=suppress_nested_tracks1,
+        prune_tracks=not fixed_slots_mode,
+        fixed_slots_mode=fixed_slots_mode,
+        # Nested suppression is intentionally done only at detection stage (pre-tracker update).
+        suppress_nested_tracks=False,
         nested_contain_thresh=nested_track_contain_thresh1,
         nested_area_ratio=nested_track_area_ratio1,
         nested_app_sim_thresh=nested_track_app_sim1
@@ -754,8 +992,12 @@ def yolo_sahi_pose_tracking(
         max_velocity=max_velocity2,
         camera_params=calib2,
         global_id_manager=shared_id_manager,
+        max_tracks=fixed_slots_count,
         is_rectified=True,  # FIX: Videos are rectified
-        suppress_nested_tracks=suppress_nested_tracks2,
+        prune_tracks=not fixed_slots_mode,
+        fixed_slots_mode=fixed_slots_mode,
+        # Nested suppression is intentionally done only at detection stage (pre-tracker update).
+        suppress_nested_tracks=False,
         nested_contain_thresh=nested_track_contain_thresh2,
         nested_area_ratio=nested_track_area_ratio2,
         nested_app_sim_thresh=nested_track_app_sim2
@@ -775,29 +1017,42 @@ def yolo_sahi_pose_tracking(
 
     # Create CSV writers
     csv_file1 = open(output_csv_path1, 'w', newline='')
-    csv_writer1 = csv.DictWriter(csv_file1, fieldnames=['frame', 'track_id', 'event', 'view', 'global_id', 'matched_with_other_view_track_id', 'new_global_id', 'old_global_id', 'view_x', 'view_y', 'view_pos_json', 'has_view_pos', 'projected_other_x', 'projected_other_y', 'projected_other_pos_json', 'has_projected_other_pos'])
+    csv_writer1 = csv.DictWriter(
+        csv_file1,
+        fieldnames=[
+            'frame', 'track_id', 'event', 'view', 'global_id',
+            'matched_with_other_view_track_id', 'new_global_id', 'old_global_id',
+            'swapped_with_track_id',
+            'detections_in_frame',
+            'view_x', 'view_y', 'view_pos_json', 'has_view_pos',
+            'projected_other_x', 'projected_other_y', 'projected_other_pos_json', 'has_projected_other_pos',
+            'assoc_projected_other_x', 'assoc_projected_other_y', 'assoc_projected_other_pos_json', 'has_assoc_projected_other_pos',
+            'assoc_native_other_x', 'assoc_native_other_y', 'assoc_native_other_pos_json', 'has_assoc_native_other_pos',
+            'assoc_match_dist_px',
+        ]
+    )
     csv_writer1.writeheader()
 
     csv_file2 = open(output_csv_path2, 'w', newline='')
-    csv_writer2 = csv.DictWriter(csv_file2, fieldnames=['frame', 'track_id', 'event', 'view', 'global_id', 'matched_with_other_view_track_id', 'new_global_id', 'old_global_id', 'view_x', 'view_y', 'view_pos_json', 'has_view_pos', 'projected_other_x', 'projected_other_y', 'projected_other_pos_json', 'has_projected_other_pos'])
+    csv_writer2 = csv.DictWriter(
+        csv_file2,
+        fieldnames=[
+            'frame', 'track_id', 'event', 'view', 'global_id',
+            'matched_with_other_view_track_id', 'new_global_id', 'old_global_id',
+            'swapped_with_track_id',
+            'detections_in_frame',
+            'view_x', 'view_y', 'view_pos_json', 'has_view_pos',
+            'projected_other_x', 'projected_other_y', 'projected_other_pos_json', 'has_projected_other_pos',
+            'assoc_projected_other_x', 'assoc_projected_other_y', 'assoc_projected_other_pos_json', 'has_assoc_projected_other_pos',
+            'assoc_native_other_x', 'assoc_native_other_y', 'assoc_native_other_pos_json', 'has_assoc_native_other_pos',
+            'assoc_match_dist_px',
+        ]
+    )
     csv_writer2.writeheader()
 
 
-    # Load annotations
-    annotations1 = load_annotations_from_dir(annotations_dir1, video_prefix1)
-    annotations2 = load_annotations_from_dir(annotations_dir2, video_prefix2)
-    if auto_start_from_annotations:
-        first_annot_frame = _min_annotated_frame(annotations1, annotations2)
-        if first_annot_frame is not None and start_frame < first_annot_frame:
-            start_frame = first_annot_frame
-
-    frame_id = start_frame
+    frame_id = 0
     fps_hist = deque(maxlen=30)
-
-    # Skip to start_frame
-    for _ in range(start_frame):
-        cap1.read()
-        cap2.read()
 
     # ===== PROCESS INITIAL FRAME =====
     ok1, frame1 = cap1.read()
@@ -856,7 +1111,7 @@ def yolo_sahi_pose_tracking(
         sahi_conf_threshold1, sahi_iou_threshold1, slice_h1, slice_w1,
         slice_overlap1, pose_model, pose_attempts1, pose_conf_threshold1,
         pose_iou_threshold1, tracker1,
-        suppress_nested=suppress_nested_detections,
+        suppress_nested=True,
         nested_contain_thresh=nested_contain_thresh,
         nested_area_ratio=nested_area_ratio,
         invalid_if_above_lines=invalid_view1_lines,
@@ -868,35 +1123,56 @@ def yolo_sahi_pose_tracking(
         sahi_conf_threshold2, sahi_iou_threshold2, slice_h2, slice_w2,
         slice_overlap2, pose_model, pose_attempts2, pose_conf_threshold2,
         pose_iou_threshold2, tracker2,
-        suppress_nested=suppress_nested_detections,
+        suppress_nested=True,
         nested_contain_thresh=nested_contain_thresh,
         nested_area_ratio=nested_area_ratio
     )
+    if annotation_gid_first_frame_only:
+        initial_detections1 = keep_annotation_gids_only_on_initial_frame(
+            initial_detections1, frame_id, initial_annotation_frame1
+        )
+        initial_detections2 = keep_annotation_gids_only_on_initial_frame(
+            initial_detections2, frame_id, initial_annotation_frame2
+        )
 
     # Update trackers with initial detections
     tracks1, _, _ = tracker1.update(
         initial_detections1, frame_id, finalize=True,
-        resolve_conflicts=(frame_id not in annotations1)
+        resolve_conflicts=((not fixed_slots_mode) and (frame_id not in annotations1))
     )
     tracks2, _, _ = tracker2.update(
         initial_detections2, frame_id, finalize=True,
-        resolve_conflicts=(frame_id not in annotations2)
+        resolve_conflicts=((not fixed_slots_mode) and (frame_id not in annotations2))
     )
+    if sticky_gid_view2 is not None:
+        active_view2_tids = {t.get('track_id') for t in tracker2.tracks}
+        stale_keys = [tid for tid in sticky_gid_view2.keys() if tid not in active_view2_tids]
+        for tid in stale_keys:
+            del sticky_gid_view2[tid]
     # Associate tracks across views (one-way: View 1 -> View 2)
-    associate_tracks_to_view1(
+    cross_view_associations = associate_tracks_to_view1(
         tracker1, tracker2, frame_id,
         homography_anchor_to_other=h_view1_to_view2,
-        max_projected_dist_px=cross_view_max_dist_px1
+        homography_other_to_anchor=h_view2_to_view1,
+        max_projected_dist_px=cross_view_max_dist_px1,
+        sticky_gid_by_other_track=sticky_gid_view2,
     )
+    assoc_lookup_view1, assoc_lookup_view2 = _build_association_lookup(cross_view_associations)
 
     # Log initial events
     for event in tracker1.get_frame_events():
         event['view'] = 1
-        _augment_event_with_view_and_projected_pos(event, tracker1, h_view1_to_view2)
+        event['detections_in_frame'] = len(initial_detections1)
+        _augment_event_with_view_and_projected_pos(
+            event, tracker1, h_view1_to_view2, association_info_by_track=assoc_lookup_view1
+        )
         csv_writer1.writerow(event)
     for event in tracker2.get_frame_events():
         event['view'] = 2
-        _augment_event_with_view_and_projected_pos(event, tracker2, h_view2_to_view1)
+        event['detections_in_frame'] = len(initial_detections2)
+        _augment_event_with_view_and_projected_pos(
+            event, tracker2, h_view2_to_view1, association_info_by_track=assoc_lookup_view2
+        )
         csv_writer2.writerow(event)
 
     # Save first frame
@@ -904,6 +1180,8 @@ def yolo_sahi_pose_tracking(
     roi2 = frame2
     out1 = draw_tracks(roi1.copy(), tracks1, None, connections, tracker1)
     out2 = draw_tracks(roi2.copy(), tracks2, None, connections, tracker2)
+    out1 = draw_cross_view_associations(out1, cross_view_associations, view_id=1)
+    out2 = draw_cross_view_associations(out2, cross_view_associations, view_id=2)
     writer1.write(out1)
     writer2.write(out2)
     
@@ -930,7 +1208,7 @@ def yolo_sahi_pose_tracking(
             sahi_conf_threshold1, sahi_iou_threshold1, slice_h1, slice_w1,
             slice_overlap1, pose_model, pose_attempts1, pose_conf_threshold1,
             pose_iou_threshold1, tracker1,
-            suppress_nested=suppress_nested_detections,
+            suppress_nested=True,
             nested_contain_thresh=nested_contain_thresh,
             nested_area_ratio=nested_area_ratio,
             invalid_if_above_lines=invalid_view1_lines,
@@ -941,37 +1219,58 @@ def yolo_sahi_pose_tracking(
             sahi_conf_threshold2, sahi_iou_threshold2, slice_h2, slice_w2,
             slice_overlap2, pose_model, pose_attempts2, pose_conf_threshold2,
             pose_iou_threshold2, tracker2,
-            suppress_nested=suppress_nested_detections,
+            suppress_nested=True,
             nested_contain_thresh=nested_contain_thresh,
             nested_area_ratio=nested_area_ratio
         )
+        if annotation_gid_first_frame_only:
+            detections1 = keep_annotation_gids_only_on_initial_frame(
+                detections1, frame_id, initial_annotation_frame1
+            )
+            detections2 = keep_annotation_gids_only_on_initial_frame(
+                detections2, frame_id, initial_annotation_frame2
+            )
         # ===== STEP 4: UPDATE TRACKERS (finalize=True) =====
         tracks1, _, _ = tracker1.update(
             detections1, frame_id, finalize=True,
-            resolve_conflicts=(frame_id not in annotations1)
+            resolve_conflicts=((not fixed_slots_mode) and (frame_id not in annotations1))
         )
         tracks2, _, _ = tracker2.update(
             detections2, frame_id, finalize=True,
-            resolve_conflicts=(frame_id not in annotations2)
+            resolve_conflicts=((not fixed_slots_mode) and (frame_id not in annotations2))
         )
+        if sticky_gid_view2 is not None:
+            active_view2_tids = {t.get('track_id') for t in tracker2.tracks}
+            stale_keys = [tid for tid in sticky_gid_view2.keys() if tid not in active_view2_tids]
+            for tid in stale_keys:
+                del sticky_gid_view2[tid]
         # ===== STEP 5: CROSS-VIEW ASSOCIATION (ONE-WAY: VIEW 1 -> VIEW 2) =====
-        associate_tracks_to_view1(
+        cross_view_associations = associate_tracks_to_view1(
             tracker1, tracker2, frame_id,
             homography_anchor_to_other=h_view1_to_view2,
-            max_projected_dist_px=cross_view_max_dist_px1
+            homography_other_to_anchor=h_view2_to_view1,
+            max_projected_dist_px=cross_view_max_dist_px1,
+            sticky_gid_by_other_track=sticky_gid_view2,
         )
+        assoc_lookup_view1, assoc_lookup_view2 = _build_association_lookup(cross_view_associations)
 
         # ===== LOG EVENTS =====
         for event in tracker1.get_frame_events():
             if 'view' not in event:
                 event['view'] = 1
-            _augment_event_with_view_and_projected_pos(event, tracker1, h_view1_to_view2)
+            event['detections_in_frame'] = len(detections1)
+            _augment_event_with_view_and_projected_pos(
+                event, tracker1, h_view1_to_view2, association_info_by_track=assoc_lookup_view1
+            )
             csv_writer1.writerow(event)
         
         for event in tracker2.get_frame_events():
             if 'view' not in event:
                 event['view'] = 2
-            _augment_event_with_view_and_projected_pos(event, tracker2, h_view2_to_view1)
+            event['detections_in_frame'] = len(detections2)
+            _augment_event_with_view_and_projected_pos(
+                event, tracker2, h_view2_to_view1, association_info_by_track=assoc_lookup_view2
+            )
             csv_writer2.writerow(event)
 
         # Refresh tracks after all operations
@@ -983,6 +1282,8 @@ def yolo_sahi_pose_tracking(
         roi2 = frame2
         out1 = draw_tracks(roi1.copy(), tracks1, None, connections, tracker1)
         out2 = draw_tracks(roi2.copy(), tracks2, None, connections, tracker2)
+        out1 = draw_cross_view_associations(out1, cross_view_associations, view_id=1)
+        out2 = draw_cross_view_associations(out2, cross_view_associations, view_id=2)
 
         dt = time.time() - start_time
         fps_hist.append(1 / dt if dt > 0 else 0)
@@ -1030,10 +1331,10 @@ if __name__ == '__main__':
             calib_path2='Tracking/material4project/3D Tracking Material/camera_data_with_Rvecs_2ndversion/camera_data/cam_4/calib/camera_calib.json',
             annotations_dir1='tracking_12.v4i.yolov11/train/labels/',
             annotations_dir2='tracking_12.v4i.yolov11/train/labels/',
-            output_path1='output_view1_improved.mp4',
-            output_path2='output_view2_improved.mp4',
-            start_frame=1,
+            output_path1='output_view1.mp4',
+            output_path2='output_view2.mp4',
             enable_pose=True,
+            fixed_slots_mode=True,
             court_lines_path1='court_lines_cam13.json',
             court_corners_path1='cam13_img_corners_rectified.json',
         )
