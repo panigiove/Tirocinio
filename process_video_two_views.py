@@ -36,22 +36,26 @@ def pad_bbox(bbox, pad_ratio, frame_shape):
 
 def process_detection_pose(frame, bbox, pose_model, pose_attempts, pose_conf_threshold, pose_iou_threshold):
     """
-    Optimized single detection pose estimation with early exit.
+    Run pose estimation with early exit and return how many attempts were executed.
     """
     if pose_model is None:
-        return None, None
-    
-    pose_kpts, pose_vec = None, None
-    
-    # Try first attempt
-    pb = pad_bbox(bbox, pose_attempts[0]['pad'], frame.shape)
-    px1, py1, px2, py2 = pb
-    crop = frame[py1:py2, px1:px2]
-    if crop.size > 0:
+        return None, None, 0
+
+    attempts_cfg = tuple(pose_attempts) if pose_attempts else ({'pad': 0.0, 'conf': None, 'iou': None},)
+    attempts_used = 0
+
+    for attempt in attempts_cfg:
+        attempts_used += 1
+        pb = pad_bbox(bbox, attempt.get('pad', 0.0), frame.shape)
+        px1, py1, px2, py2 = pb
+        crop = frame[py1:py2, px1:px2]
+        if crop.size <= 0:
+            continue
+
         res = pose_model.predict(
-            crop, 
-            conf=pose_attempts[0].get('conf') or pose_conf_threshold,
-            iou=pose_attempts[0].get('iou') or pose_iou_threshold,
+            crop,
+            conf=attempt.get('conf') or pose_conf_threshold,
+            iou=attempt.get('iou') or pose_iou_threshold,
             imgsz=round_to_multiple(max(crop.shape[:2]), 32),
             device='cuda',
             verbose=False
@@ -60,28 +64,9 @@ def process_detection_pose(frame, bbox, pose_model, pose_attempts, pose_conf_thr
             k = res[0].keypoints.xy.cpu().numpy()[0]
             pose_kpts = k + np.array([px1, py1])
             pose_vec = keypoints_to_pose_vec(pose_kpts, bbox)
-            return pose_kpts, pose_vec
-    
-    # Fallback to second attempt
-    if len(pose_attempts) > 1:
-        pb = pad_bbox(bbox, pose_attempts[1]['pad'], frame.shape)
-        px1, py1, px2, py2 = pb
-        crop = frame[py1:py2, px1:px2]
-        if crop.size > 0:
-            res = pose_model.predict(
-                crop,
-                conf=pose_attempts[1].get('conf') or pose_conf_threshold,
-                iou=pose_attempts[1].get('iou') or pose_iou_threshold,
-                imgsz=round_to_multiple(max(crop.shape[:2]), 32),
-                device='cuda',
-                verbose=False
-            )
-            if res and len(res[0].keypoints.xy) > 0:
-                k = res[0].keypoints.xy.cpu().numpy()[0]
-                pose_kpts = k + np.array([px1, py1])
-                pose_vec = keypoints_to_pose_vec(pose_kpts, bbox)
-    
-    return pose_kpts, pose_vec
+            return pose_kpts, pose_vec, attempts_used
+
+    return None, None, attempts_used
 
 
 def draw_text_with_bg(img, text, pos, scale=0.6):
@@ -106,7 +91,7 @@ def resize_for_display(img, max_width=1280, max_height=720):
     return cv.resize(img, (out_w, out_h), interpolation=cv.INTER_AREA)
 
 
-def parse_yolo_annotations(anno_file, img_width, img_height, frame, pose_model, pose_attempts, 
+def parse_yolo_annotations(anno_file, img_width, img_height, frame, pose_model, pose_attempts,
                           pose_conf_threshold, pose_iou_threshold, tracker=None):
     """Parse YOLO format annotations from file."""
     detections = []
@@ -131,7 +116,7 @@ def parse_yolo_annotations(anno_file, img_width, img_height, frame, pose_model, 
                 bbox = (x1, y1, x2, y2)
 
                 appearance = compute_team_appearence(frame, bbox)
-                pose_kpts, pose_vec = process_detection_pose(
+                pose_kpts, pose_vec, pose_attempts_used = process_detection_pose(
                     frame, bbox, pose_model, pose_attempts, 
                     pose_conf_threshold, pose_iou_threshold
                 )
@@ -142,6 +127,7 @@ def parse_yolo_annotations(anno_file, img_width, img_height, frame, pose_model, 
                     'appearance': appearance,
                     'keypoints': pose_kpts,
                     'pose_vec': pose_vec,
+                    'pose_attempts_used': int(pose_attempts_used),
                     'world_pos': world_pos,
                     'score': 1.0,
                     'global_id': class_id,
@@ -328,6 +314,33 @@ def _build_association_lookup(associations):
                 'distance_px': dist,
             }
     return by_view1_track, by_view2_track
+
+
+def _compute_pose_attempt_metrics(detections):
+    attempts = []
+    for d in detections or []:
+        v = d.get('pose_attempts_used', 0)
+        try:
+            v = int(v)
+        except (TypeError, ValueError):
+            v = 0
+        attempts.append(max(0, v))
+
+    max_attempts = max(attempts) if attempts else 0
+    return {
+        'pose_ran_second_attempt': int(any(v > 1 for v in attempts)),
+        'pose_ran_more_than_second_attempt': int(any(v > 2 for v in attempts)),
+        'pose_max_attempts_used': int(max_attempts),
+    }
+
+
+def _augment_event_with_pose_attempts(event, pose_attempt_metrics):
+    event['pose_ran_second_attempt'] = int(pose_attempt_metrics.get('pose_ran_second_attempt', 0))
+    event['pose_ran_more_than_second_attempt'] = int(
+        pose_attempt_metrics.get('pose_ran_more_than_second_attempt', 0)
+    )
+    event['pose_max_attempts_used'] = int(pose_attempt_metrics.get('pose_max_attempts_used', 0))
+    return event
 
 
 def _augment_event_with_view_and_projected_pos(event, tracker, homography_to_other, association_info_by_track=None):
@@ -560,21 +573,6 @@ def scale_lines(lines, sx, sy):
     return out
 
 
-def draw_court_lines(img, lines, color=(0, 255, 0), thickness=2, label=True):
-    if img is None or not lines:
-        return img
-    for l in lines:
-        p1 = l['p1']
-        p2 = l['p2']
-        x1, y1 = int(round(p1[0])), int(round(p1[1]))
-        x2, y2 = int(round(p2[0])), int(round(p2[1]))
-        cv.line(img, (x1, y1), (x2, y2), color, thickness)
-        if label:
-            mx, my = (x1 + x2) // 2, (y1 + y2) // 2
-            cv.putText(img, str(l['line_id']), (mx + 4, my - 4),
-                       cv.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-    return img
-
 def _is_point_above_line_segment(pt, line, ref_pt):
     p1 = line['p1']
     p2 = line['p2']
@@ -613,8 +611,8 @@ def _filter_detections_above_lines(detections, lines, ref_pt):
 
     valid = []
     for d in detections:
-        x1, y1, x2, y2 = d['bbox']
-        bottom_center = np.array([(x1 + x2) / 2.0, y2], dtype=np.float32)
+        bbox = d['bbox']
+        bottom_center = np.array([(bbox[0] + bbox[2]) / 2.0, bbox[3]], dtype=np.float32)
         invalid = False
         for line in lines:
             if _is_point_above_line_segment(bottom_center, line, ref_pt):
@@ -674,13 +672,19 @@ def detect_view(frame, frame_id, annotations, det_model,
         )
 
     for d in detections:
-        if d.get('keypoints') is None:
-            kpts, vec = process_detection_pose(
+        if d.get('pose_attempts_used') is None:
+            kpts, vec, attempts_used = process_detection_pose(
                 frame, d['bbox'], pose_model, pose_attempts,
                 pose_conf_threshold, pose_iou_threshold
             )
             d['keypoints'] = kpts
             d['pose_vec'] = vec
+            d['pose_attempts_used'] = int(attempts_used)
+        elif d.get('pose_attempts_used') is not None:
+            try:
+                d['pose_attempts_used'] = int(d['pose_attempts_used'])
+            except (TypeError, ValueError):
+                d['pose_attempts_used'] = 0
         # Force bbox-bottom-center anchoring for world coordinates.
         d['world_pos'] = tracker.project_to_world(d['bbox']) if tracker else None
 
@@ -701,8 +705,7 @@ def merge_track_global_id(tracker, track, target_gid, frame_id, allow_target_con
 
 
 def _bbox_bottom_center(bbox):
-    x1, y1, x2, y2 = bbox
-    return np.array([(x1 + x2) / 2.0, y2], dtype=np.float32)
+    return np.array([(bbox[0] + bbox[2]) / 2.0, bbox[3]], dtype=np.float32)
 
 
 def associate_tracks_to_view1(
@@ -825,12 +828,8 @@ def yolo_sahi_pose_tracking(
     slice_w1=480,
     slice_overlap1=0.3,
     # pose View 1
-    pose_conf_threshold1=0.09,
-    pose_iou_threshold1=0.02,
-    pose_attempts1=(
-        {'pad': 0.0, 'conf': None, 'iou': None},
-        {'pad': 0.25, 'conf': 0.03, 'iou': 0.005},
-    ),
+    pose_conf_threshold1=0.03,
+    pose_iou_threshold1=0.005,
     # tracker View 1
     match_threshold1=0.45,
     iou_weight1=0.55,
@@ -838,7 +837,6 @@ def yolo_sahi_pose_tracking(
     pose_weight1=0.25,
     ema_alpha1=0.5,
     max_velocity1=200.0,
-    suppress_nested_tracks1=False,
     nested_track_contain_thresh1=0.9,
     nested_track_area_ratio1=0.6,
     nested_track_app_sim1=0.7,
@@ -851,7 +849,7 @@ def yolo_sahi_pose_tracking(
     slice_w2=640,
     slice_overlap2=0.15,
     # pose View 2
-    pose_conf_threshold2=0.15,
+    pose_conf_threshold2=0.10,
     pose_iou_threshold2=0.02,
     pose_attempts2=(
         {'pad': 0.0, 'conf': None, 'iou': None},
@@ -1024,6 +1022,7 @@ def yolo_sahi_pose_tracking(
             'matched_with_other_view_track_id', 'new_global_id', 'old_global_id',
             'swapped_with_track_id',
             'detections_in_frame',
+            'pose_ran_second_attempt', 'pose_ran_more_than_second_attempt', 'pose_max_attempts_used',
             'view_x', 'view_y', 'view_pos_json', 'has_view_pos',
             'projected_other_x', 'projected_other_y', 'projected_other_pos_json', 'has_projected_other_pos',
             'assoc_projected_other_x', 'assoc_projected_other_y', 'assoc_projected_other_pos_json', 'has_assoc_projected_other_pos',
@@ -1041,6 +1040,7 @@ def yolo_sahi_pose_tracking(
             'matched_with_other_view_track_id', 'new_global_id', 'old_global_id',
             'swapped_with_track_id',
             'detections_in_frame',
+            'pose_ran_second_attempt', 'pose_ran_more_than_second_attempt', 'pose_max_attempts_used',
             'view_x', 'view_y', 'view_pos_json', 'has_view_pos',
             'projected_other_x', 'projected_other_y', 'projected_other_pos_json', 'has_projected_other_pos',
             'assoc_projected_other_x', 'assoc_projected_other_y', 'assoc_projected_other_pos_json', 'has_assoc_projected_other_pos',
@@ -1106,10 +1106,15 @@ def yolo_sahi_pose_tracking(
         invalid_ids = {int(v) for v in invalid_view1_line_ids}
         invalid_view1_lines = [l for l in line_debug1 if l['line_id'] in invalid_ids]
 
+    # View 1: force a single pose attempt using the former fallback settings.
+    pose_attempts_view1_runtime = (
+        {'pad': 0.25, 'conf': pose_conf_threshold1, 'iou': pose_iou_threshold1},
+    )
+
     initial_detections1 = detect_view(
         frame1, frame_id, annotations1, det_model,
         sahi_conf_threshold1, sahi_iou_threshold1, slice_h1, slice_w1,
-        slice_overlap1, pose_model, pose_attempts1, pose_conf_threshold1,
+        slice_overlap1, pose_model, pose_attempts_view1_runtime, pose_conf_threshold1,
         pose_iou_threshold1, tracker1,
         suppress_nested=True,
         nested_contain_thresh=nested_contain_thresh,
@@ -1136,14 +1141,14 @@ def yolo_sahi_pose_tracking(
         )
 
     # Update trackers with initial detections
-    tracks1, _, _ = tracker1.update(
+    tracks1 = tracker1.update(
         initial_detections1, frame_id, finalize=True,
         resolve_conflicts=((not fixed_slots_mode) and (frame_id not in annotations1))
-    )
-    tracks2, _, _ = tracker2.update(
+    )[0]
+    tracks2 = tracker2.update(
         initial_detections2, frame_id, finalize=True,
         resolve_conflicts=((not fixed_slots_mode) and (frame_id not in annotations2))
-    )
+    )[0]
     if sticky_gid_view2 is not None:
         active_view2_tids = {t.get('track_id') for t in tracker2.tracks}
         stale_keys = [tid for tid in sticky_gid_view2.keys() if tid not in active_view2_tids]
@@ -1158,11 +1163,14 @@ def yolo_sahi_pose_tracking(
         sticky_gid_by_other_track=sticky_gid_view2,
     )
     assoc_lookup_view1, assoc_lookup_view2 = _build_association_lookup(cross_view_associations)
+    pose_metrics_view1 = _compute_pose_attempt_metrics(initial_detections1)
+    pose_metrics_view2 = _compute_pose_attempt_metrics(initial_detections2)
 
     # Log initial events
     for event in tracker1.get_frame_events():
         event['view'] = 1
         event['detections_in_frame'] = len(initial_detections1)
+        _augment_event_with_pose_attempts(event, pose_metrics_view1)
         _augment_event_with_view_and_projected_pos(
             event, tracker1, h_view1_to_view2, association_info_by_track=assoc_lookup_view1
         )
@@ -1170,6 +1178,7 @@ def yolo_sahi_pose_tracking(
     for event in tracker2.get_frame_events():
         event['view'] = 2
         event['detections_in_frame'] = len(initial_detections2)
+        _augment_event_with_pose_attempts(event, pose_metrics_view2)
         _augment_event_with_view_and_projected_pos(
             event, tracker2, h_view2_to_view1, association_info_by_track=assoc_lookup_view2
         )
@@ -1206,7 +1215,7 @@ def yolo_sahi_pose_tracking(
         detections1 = detect_view(
             frame1, frame_id, annotations1, det_model,
             sahi_conf_threshold1, sahi_iou_threshold1, slice_h1, slice_w1,
-            slice_overlap1, pose_model, pose_attempts1, pose_conf_threshold1,
+            slice_overlap1, pose_model, pose_attempts_view1_runtime, pose_conf_threshold1,
             pose_iou_threshold1, tracker1,
             suppress_nested=True,
             nested_contain_thresh=nested_contain_thresh,
@@ -1231,14 +1240,14 @@ def yolo_sahi_pose_tracking(
                 detections2, frame_id, initial_annotation_frame2
             )
         # ===== STEP 4: UPDATE TRACKERS (finalize=True) =====
-        tracks1, _, _ = tracker1.update(
+        tracks1 = tracker1.update(
             detections1, frame_id, finalize=True,
             resolve_conflicts=((not fixed_slots_mode) and (frame_id not in annotations1))
-        )
-        tracks2, _, _ = tracker2.update(
+        )[0]
+        tracks2 = tracker2.update(
             detections2, frame_id, finalize=True,
             resolve_conflicts=((not fixed_slots_mode) and (frame_id not in annotations2))
-        )
+        )[0]
         if sticky_gid_view2 is not None:
             active_view2_tids = {t.get('track_id') for t in tracker2.tracks}
             stale_keys = [tid for tid in sticky_gid_view2.keys() if tid not in active_view2_tids]
@@ -1253,12 +1262,15 @@ def yolo_sahi_pose_tracking(
             sticky_gid_by_other_track=sticky_gid_view2,
         )
         assoc_lookup_view1, assoc_lookup_view2 = _build_association_lookup(cross_view_associations)
+        pose_metrics_view1 = _compute_pose_attempt_metrics(detections1)
+        pose_metrics_view2 = _compute_pose_attempt_metrics(detections2)
 
         # ===== LOG EVENTS =====
         for event in tracker1.get_frame_events():
             if 'view' not in event:
                 event['view'] = 1
             event['detections_in_frame'] = len(detections1)
+            _augment_event_with_pose_attempts(event, pose_metrics_view1)
             _augment_event_with_view_and_projected_pos(
                 event, tracker1, h_view1_to_view2, association_info_by_track=assoc_lookup_view1
             )
@@ -1268,6 +1280,7 @@ def yolo_sahi_pose_tracking(
             if 'view' not in event:
                 event['view'] = 2
             event['detections_in_frame'] = len(detections2)
+            _augment_event_with_pose_attempts(event, pose_metrics_view2)
             _augment_event_with_view_and_projected_pos(
                 event, tracker2, h_view2_to_view1, association_info_by_track=assoc_lookup_view2
             )

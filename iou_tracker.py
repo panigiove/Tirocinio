@@ -52,7 +52,7 @@ class GlobalIDManager:
         if current_id >= self._next_id:
             self._next_id = current_id + 1
 
-    def claim_id(self, gid, frame_id=None):
+    def claim_id(self, gid, _frame_id=None):
         gid = int(gid)
         if gid not in self._active_counts:
             if self._fixed_pool:
@@ -84,12 +84,10 @@ class GlobalIDManager:
 
         frame_id = int(frame_id)
         free_and_cooled = []
-        free_any = []
 
         for gid in self._gids:
             if self._active_counts[gid] != 0:
                 continue
-            free_any.append(gid)
             if (frame_id - self._last_released_frame[gid]) >= self.cooldown_frames:
                 free_and_cooled.append(gid)
 
@@ -183,7 +181,7 @@ class IOUTracker:
                 self.tvec = self.tvec.reshape(3, 1)
             
             # Compute rotation matrix
-            R, _ = cv2.Rodrigues(self.rvec)
+            R = cv2.Rodrigues(self.rvec)[0]
             
             # Compute projection matrix P = K * [R | t]
             self.P = self.mtx @ np.hstack([R, self.tvec])
@@ -288,7 +286,7 @@ class IOUTracker:
             return None
         H_inv = self.H_inv_dynamic if self.H_inv_dynamic is not None else self.H_inv
         
-        x1, y1, x2, y2 = bbox
+        x1, x2, y2 = bbox[0], bbox[2], bbox[3]
         # Use the bottom center of the bounding box as the feet position
         pixel_point = np.array([(x1 + x2) / 2.0, y2, 1.0], dtype=np.float32).reshape(3, 1)
         
@@ -313,16 +311,18 @@ class IOUTracker:
             pts_3d = np.array([world_pos], dtype=np.float32)
         
         # FIX: Use dist=None for rectified videos
-        img_pts, _ = cv2.projectPoints(pts_3d, self.rvec, self.tvec, self.mtx, self.dist)
+        img_pts = cv2.projectPoints(pts_3d, self.rvec, self.tvec, self.mtx, self.dist)[0]
         return img_pts[0][0]  # Returns [x, y]
 
 
-    def _appearance_sim(self, a, b):
+    @staticmethod
+    def _appearance_sim(a, b):
         if a is None or b is None:
             return 0.0
         return float(np.dot(a, b))  # cosine similarity (vectors are normalized)
 
-    def _pose_sim(self, p1, p2):
+    @staticmethod
+    def _pose_sim(p1, p2):
         if p1 is None or p2 is None:
             return 0.0
         # for pose, a smaller distance means higher similarity.
