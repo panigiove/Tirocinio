@@ -28,12 +28,6 @@ def process_video(video_path, calib_path, output_path):
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
     
-
-    grid_x, grid_y = np.meshgrid(np.arange(width), np.arange(height))
-    pts = np.stack([grid_x, grid_y], axis=-1).astype(np.float32)
-    pts = pts.reshape(-1, 1, 2)
-
-    
     frame_count = 0
     while True:
         ret, frame = cap.read()
@@ -41,7 +35,7 @@ def process_video(video_path, calib_path, output_path):
             break
         
         h, w = frame.shape[:2]
-        newcameramtx, roi = cv2.getOptimalNewCameraMatrix(mtx, dist, (w, h), 0, (w, h))
+        newcameramtx, _ = cv2.getOptimalNewCameraMatrix(mtx, dist, (w, h), 0, (w, h))
         undistorted_frame = cv2.undistort(frame, mtx, dist, None, newcameramtx)
         out.write(undistorted_frame)
         frame_count += 1

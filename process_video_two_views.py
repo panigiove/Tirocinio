@@ -714,18 +714,32 @@ def associate_tracks_to_view1(
     homography_other_to_anchor=None,
     max_projected_dist_px=120.0,
     sticky_gid_by_other_track=None,
+    only_visible_tracks=True,
 ):
-    # Consider every non-lost track so cross-view GID assignment can run every frame.
-    max_missed_1 = int(getattr(tracker1, 'max_missed', 0))
-    max_missed_other = int(getattr(tracker_other, 'max_missed', 0))
-    active1 = [
-        t for t in tracker1.tracks
-        if t.get('bbox') is not None and t.get('missed', 0) <= max_missed_1
-    ]
-    active_other = [
-        t for t in tracker_other.tracks
-        if t.get('bbox') is not None and t.get('missed', 0) <= max_missed_other
-    ]
+    # By default, consider only currently visible tracks to avoid lingering
+    # cross-view points after occlusion/exit.
+    # GID reassignment is applied only for confident occlusion recovery:
+    # exactly one side was refound in this frame.
+    if only_visible_tracks:
+        active1 = [
+            t for t in tracker1.tracks
+            if t.get('bbox') is not None and t.get('missed', 0) == 0
+        ]
+        active_other = [
+            t for t in tracker_other.tracks
+            if t.get('bbox') is not None and t.get('missed', 0) == 0
+        ]
+    else:
+        max_missed_1 = int(getattr(tracker1, 'max_missed', 0))
+        max_missed_other = int(getattr(tracker_other, 'max_missed', 0))
+        active1 = [
+            t for t in tracker1.tracks
+            if t.get('bbox') is not None and t.get('missed', 0) <= max_missed_1
+        ]
+        active_other = [
+            t for t in tracker_other.tracks
+            if t.get('bbox') is not None and t.get('missed', 0) <= max_missed_other
+        ]
     if not active1 or not active_other:
         return []
 
@@ -772,21 +786,34 @@ def associate_tracks_to_view1(
         t2 = active_other[c]
         gid1 = t1['global_id']
         other_tid = t2.get('track_id')
+        gid2 = t2.get('global_id')
+        refound1 = bool(t1.get('was_refound_in_this_frame'))
+        refound2 = bool(t2.get('was_refound_in_this_frame'))
 
-        target_gid = gid1
-        merged1 = merge_track_global_id(
-            tracker1, t1, target_gid, frame_id, allow_target_conflict=True
-        )
-        merged2 = merge_track_global_id(
-            tracker_other, t2, target_gid, frame_id, allow_target_conflict=True
-        )
-        if not (merged1 and merged2):
-            continue
+        # Reassign only when one view refound the target and the other view
+        # has a stable identity in this frame.
+        target_gid = None
+        if refound1 and not refound2:
+            target_gid = gid2
+        elif refound2 and not refound1:
+            target_gid = gid1
 
-        if sticky_gid_by_other_track is not None and other_tid is not None:
-            sticky_gid_by_other_track[other_tid] = target_gid
-        if t1.get('gid_source') == 'annotation':
-            t2['gid_source'] = 'annotation'
+        gid_reassigned = False
+        if target_gid is not None:
+            merged1 = merge_track_global_id(
+                tracker1, t1, target_gid, frame_id, allow_target_conflict=True
+            )
+            merged2 = merge_track_global_id(
+                tracker_other, t2, target_gid, frame_id, allow_target_conflict=True
+            )
+            if merged1 and merged2:
+                gid_reassigned = True
+                if sticky_gid_by_other_track is not None and other_tid is not None:
+                    sticky_gid_by_other_track[other_tid] = target_gid
+                if refound1 and t2.get('gid_source') == 'annotation':
+                    t1['gid_source'] = 'annotation'
+                elif refound2 and t1.get('gid_source') == 'annotation':
+                    t2['gid_source'] = 'annotation'
 
         p2 = projected_to_other[r]
         n1_pt = native_view1[r]
@@ -795,15 +822,19 @@ def associate_tracks_to_view1(
         if homography_other_to_anchor is not None and n2_pt is not None and np.all(np.isfinite(n2_pt)):
             p1 = project_point_with_homography(n2_pt, homography_other_to_anchor)
 
+        assoc_gid = t1.get('global_id')
+        if assoc_gid is None:
+            assoc_gid = t2.get('global_id')
         associations.append({
             'track_id_view1': t1.get('track_id'),
             'track_id_view2': t2.get('track_id'),
-            'global_id': target_gid,
+            'global_id': assoc_gid,
             'native_view1': n1_pt,
             'projected_view1': p1,
             'native_view2': n2_pt,
             'projected_view2': p2,
             'distance_px': dist,
+            'gid_reassigned': int(gid_reassigned),
         })
     return associations
 
@@ -841,6 +872,7 @@ def yolo_sahi_pose_tracking(
     nested_track_area_ratio1=0.6,
     nested_track_app_sim1=0.7,
     cross_view_max_dist_px1=120.0,
+    cross_view_only_visible_tracks=True,
     max_missed_frames1=80,
     # detection View 2
     sahi_conf_threshold2=0.55,
@@ -974,7 +1006,7 @@ def yolo_sahi_pose_tracking(
         prune_tracks=not fixed_slots_mode,
         fixed_slots_mode=fixed_slots_mode,
         # Nested suppression is intentionally done only at detection stage (pre-tracker update).
-        suppress_nested_tracks=False,
+        suppress_nested_tracks=True,
         nested_contain_thresh=nested_track_contain_thresh1,
         nested_area_ratio=nested_track_area_ratio1,
         nested_app_sim_thresh=nested_track_app_sim1
@@ -995,7 +1027,7 @@ def yolo_sahi_pose_tracking(
         prune_tracks=not fixed_slots_mode,
         fixed_slots_mode=fixed_slots_mode,
         # Nested suppression is intentionally done only at detection stage (pre-tracker update).
-        suppress_nested_tracks=False,
+        suppress_nested_tracks=True,
         nested_contain_thresh=nested_track_contain_thresh2,
         nested_area_ratio=nested_track_area_ratio2,
         nested_app_sim_thresh=nested_track_app_sim2
@@ -1161,6 +1193,7 @@ def yolo_sahi_pose_tracking(
         homography_other_to_anchor=h_view2_to_view1,
         max_projected_dist_px=cross_view_max_dist_px1,
         sticky_gid_by_other_track=sticky_gid_view2,
+        only_visible_tracks=cross_view_only_visible_tracks,
     )
     assoc_lookup_view1, assoc_lookup_view2 = _build_association_lookup(cross_view_associations)
     pose_metrics_view1 = _compute_pose_attempt_metrics(initial_detections1)
@@ -1260,6 +1293,7 @@ def yolo_sahi_pose_tracking(
             homography_other_to_anchor=h_view2_to_view1,
             max_projected_dist_px=cross_view_max_dist_px1,
             sticky_gid_by_other_track=sticky_gid_view2,
+            only_visible_tracks=cross_view_only_visible_tracks,
         )
         assoc_lookup_view1, assoc_lookup_view2 = _build_association_lookup(cross_view_associations)
         pose_metrics_view1 = _compute_pose_attempt_metrics(detections1)

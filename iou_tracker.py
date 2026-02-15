@@ -182,15 +182,11 @@ class IOUTracker:
             
             # Compute rotation matrix
             R = cv2.Rodrigues(self.rvec)[0]
-            
-            # Compute projection matrix P = K * [R | t]
-            self.P = self.mtx @ np.hstack([R, self.tvec])
 
             # FIX: Correct homography to ground plane (Z=0)
             # H = K * [r1 r2 t] where r1, r2 are first two columns of R
             H = self.mtx @ np.column_stack([R[:, 0], R[:, 1], self.tvec.flatten()])
             self.H_inv = np.linalg.inv(H)
-        self.H_inv_dynamic = None
 
         self.tracks = []
         self.next_id = 0
@@ -284,7 +280,7 @@ class IOUTracker:
         """Project the bottom center of the bounding box to the ground plane (Z=0)."""
         if not hasattr(self, 'H_inv'):
             return None
-        H_inv = self.H_inv_dynamic if self.H_inv_dynamic is not None else self.H_inv
+        H_inv = self.H_inv
         
         x1, x2, y2 = bbox[0], bbox[2], bbox[3]
         # Use the bottom center of the bounding box as the feet position
@@ -295,25 +291,6 @@ class IOUTracker:
         
         # FIX: Return 3D point with Z=0 for consistency
         return np.array([world_point[0, 0], world_point[1, 0], 0.0], dtype=np.float32)
-
-    def set_dynamic_hinv(self, H_inv):
-        self.H_inv_dynamic = H_inv
-
-    def project_to_pixel(self, world_pos):
-        """Project world point (X, Y, Z) back to pixel coordinates (x, y)."""
-        if not hasattr(self, 'mtx') or self.mtx is None:
-            return None
-        
-        # world_pos can be (X, Y) or (X, Y, Z)
-        if len(world_pos) == 2:
-            pts_3d = np.array([[world_pos[0], world_pos[1], 0.0]], dtype=np.float32)
-        else:
-            pts_3d = np.array([world_pos], dtype=np.float32)
-        
-        # FIX: Use dist=None for rectified videos
-        img_pts = cv2.projectPoints(pts_3d, self.rvec, self.tvec, self.mtx, self.dist)[0]
-        return img_pts[0][0]  # Returns [x, y]
-
 
     @staticmethod
     def _appearance_sim(a, b):

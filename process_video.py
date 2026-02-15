@@ -13,11 +13,11 @@ from sahi.predict import get_sliced_prediction
 from sahi import AutoDetectionModel
 import csv # new import
 
-from iou_tracker import IOUTracker
+from iou_tracker_old_version import IOUTracker
 from appearence_utils import compute_team_appearence, keypoints_to_pose_vec
 
 # ================= ROI / MASK =================
-TRAPEZOID_TOP_LEFT = (210, 380)
+TRAPEZOID_TOP_LEFT = (210, 350)
 TRAPEZ_TOP_RIGHT = (1240, 350)
 TRAPEZ_BOTTOM_LEFT = (0, 665)
 TRAPEZ_BOTTOM_RIGHT = (1440, 665)
@@ -263,4 +263,4 @@ def yolo_sahi_pose_tracking(
 
 
 if __name__ == '__main__':
-    yolo_sahi_pose_tracking('video raw/video-20260119T131608Z-1-004/video/tracking_12/out4.mp4')
+    yolo_sahi_pose_tracking('Tracking/material4project/video/tracking_12/out13.mp4')
