@@ -1,0 +1,56 @@
+{
+    "rectified_img_corners_corrispondency": [
+        {
+            "point_id_cam13": 7,
+            "point_id_basketball_court": 0
+        },
+        {
+            "point_id_cam13": 8,
+            "point_id_basketball_court": 1
+        },
+        {
+            "point_id_cam13": 9,
+            "point_id_basketball_court": 2
+        },
+        {
+            "point_id_cam13": 10,
+            "point_id_basketball_court": 3
+        },
+        {
+            "point_id_cam13": 11,
+            "point_id_basketball_court": 4
+        },
+        {
+            "point_id_cam13": 12,
+            "point_id_basketball_court": 5
+        },
+        {
+            "point_id_cam13": 13,
+            "point_id_basketball_court": 6
+        },
+        {
+            "point_id_cam13": 14,
+            "point_id_basketball_court": 7
+        },
+        {
+            "point_id_cam13": 15,
+            "point_id_basketball_court": 8
+        },
+        {
+            "point_id_cam13": 16,
+            "point_id_basketball_court": 9
+        },
+        {
+            "point_id_cam13": 17,
+            "point_id_basketball_court": 10
+        },
+        {
+            "point_id_cam13": 18,
+            "point_id_basketball_court": 11
+        },
+        {
+            "point_id_cam13": 19,
+            "point_id_basketball_court": 12
+        }
+    ]
+}

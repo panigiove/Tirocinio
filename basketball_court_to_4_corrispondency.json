@@ -1,0 +1,28 @@
+{
+    "rectified_img_corners_corrispondency": [
+        {
+            "point_id_cam4": 5,
+            "point_id_basketball_court": 0
+        },
+        {
+            "point_id_cam4": 6,
+            "point_id_basketball_court": 1
+        },
+        {
+            "point_id_cam4": 7,
+            "point_id_basketball_court": 3
+        },
+        {
+            "point_id_cam4": 8,
+            "point_id_basketball_court": 4
+        },
+        {
+            "point_id_cam4": 9,
+            "point_id_basketball_court": 11
+        },
+        {
+            "point_id_cam4": 10,
+            "point_id_basketball_court": 12
+        }
+    ]
+}

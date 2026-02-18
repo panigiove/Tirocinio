@@ -34,39 +34,34 @@ def pad_bbox(bbox, pad_ratio, frame_shape):
     )
 
 
-def process_detection_pose(frame, bbox, pose_model, pose_attempts, pose_conf_threshold, pose_iou_threshold):
+def process_detection_pose(frame, bbox, pose_model, pose_conf_threshold, pose_iou_threshold):
     """
-    Run pose estimation with early exit and return how many attempts were executed.
+    Run a single pose estimation pass on the detection crop.
     """
     if pose_model is None:
         return None, None, 0
 
-    attempts_cfg = tuple(pose_attempts) if pose_attempts else ({'pad': 0.0, 'conf': None, 'iou': None},)
-    attempts_used = 0
+    pb = pad_bbox(bbox, 0.0, frame.shape)
+    px1, py1, px2, py2 = pb
+    crop = frame[py1:py2, px1:px2]
+    if crop.size <= 0:
+        return None, None, 1
 
-    for attempt in attempts_cfg:
-        attempts_used += 1
-        pb = pad_bbox(bbox, attempt.get('pad', 0.0), frame.shape)
-        px1, py1, px2, py2 = pb
-        crop = frame[py1:py2, px1:px2]
-        if crop.size <= 0:
-            continue
+    res = pose_model.predict(
+        crop,
+        conf=pose_conf_threshold,
+        iou=pose_iou_threshold,
+        imgsz=round_to_multiple(max(crop.shape[:2]), 32),
+        device='cuda',
+        verbose=False
+    )
+    if res and len(res[0].keypoints.xy) > 0:
+        k = res[0].keypoints.xy.cpu().numpy()[0]
+        pose_kpts = k + np.array([px1, py1])
+        pose_vec = keypoints_to_pose_vec(pose_kpts, bbox)
+        return pose_kpts, pose_vec, 1
 
-        res = pose_model.predict(
-            crop,
-            conf=attempt.get('conf') or pose_conf_threshold,
-            iou=attempt.get('iou') or pose_iou_threshold,
-            imgsz=round_to_multiple(max(crop.shape[:2]), 32),
-            device='cuda',
-            verbose=False
-        )
-        if res and len(res[0].keypoints.xy) > 0:
-            k = res[0].keypoints.xy.cpu().numpy()[0]
-            pose_kpts = k + np.array([px1, py1])
-            pose_vec = keypoints_to_pose_vec(pose_kpts, bbox)
-            return pose_kpts, pose_vec, attempts_used
-
-    return None, None, attempts_used
+    return None, None, 1
 
 
 def draw_text_with_bg(img, text, pos, scale=0.6):
@@ -91,8 +86,8 @@ def resize_for_display(img, max_width=1280, max_height=720):
     return cv.resize(img, (out_w, out_h), interpolation=cv.INTER_AREA)
 
 
-def parse_yolo_annotations(anno_file, img_width, img_height, frame, pose_model, pose_attempts,
-                          pose_conf_threshold, pose_iou_threshold, tracker=None):
+def parse_yolo_annotations(anno_file, img_width, img_height, frame, pose_model,
+                          pose_conf_threshold, pose_iou_threshold, world_homography=None):
     """Parse YOLO format annotations from file."""
     detections = []
     if not os.path.exists(anno_file):
@@ -117,10 +112,10 @@ def parse_yolo_annotations(anno_file, img_width, img_height, frame, pose_model, 
 
                 appearance = compute_team_appearence(frame, bbox)
                 pose_kpts, pose_vec, pose_attempts_used = process_detection_pose(
-                    frame, bbox, pose_model, pose_attempts, 
+                    frame, bbox, pose_model,
                     pose_conf_threshold, pose_iou_threshold
                 )
-                world_pos = tracker.project_to_world(bbox) if tracker else None
+                world_pos = _bbox_to_reference_plane(bbox, world_homography)
 
                 detections.append({
                     'bbox': bbox,
@@ -131,7 +126,6 @@ def parse_yolo_annotations(anno_file, img_width, img_height, frame, pose_model, 
                     'world_pos': world_pos,
                     'score': 1.0,
                     'global_id': class_id,
-                    'gid_source': 'annotation'
                 })
     except Exception as e:
         print(f"Error parsing annotations from {anno_file}: {e}")
@@ -140,11 +134,11 @@ def parse_yolo_annotations(anno_file, img_width, img_height, frame, pose_model, 
 
 
 def load_annotations_from_dir(annotations_dir, video_prefix):
-    """Load all annotation files from a directory."""
-    annotations = {}
+    """Load annotation files from a directory, keeping only the earliest frame."""
     if not annotations_dir or not os.path.exists(annotations_dir):
-        return annotations
-    
+        return {}
+
+    annotations = {}
     for file in os.listdir(annotations_dir):
         if file.startswith(video_prefix + '_') and file.endswith('_rectified.txt'):
             match = re.search(r'frame_(\d+)', file)
@@ -154,8 +148,23 @@ def load_annotations_from_dir(annotations_dir, video_prefix):
                 if frame_id not in annotations:
                     annotations[frame_id] = []
                 annotations[frame_id].append(anno_path)
-    
-    return annotations
+
+    if not annotations:
+        return {}
+
+    first_frame = min(annotations.keys())
+    dropped_frames = [fid for fid in sorted(annotations.keys()) if fid != first_frame]
+    if dropped_frames:
+        print(
+            f"Keeping only first annotation frame {first_frame}; "
+            f"ignoring later annotation frames {dropped_frames}"
+        )
+    if first_frame != 0:
+        print(
+            f"Remapping annotation frame {first_frame} to processing frame 0 "
+            f"for {video_prefix}"
+        )
+    return {0: annotations[first_frame]}
 
 
 def _count_valid_yolo_boxes(anno_files):
@@ -174,64 +183,57 @@ def _count_valid_yolo_boxes(anno_files):
     return total
 
 
-def infer_slot_count_from_first_annotation_frame(annotations):
+def _extract_yolo_gids(anno_files):
+    gids = set()
+    for anno_path in anno_files or []:
+        if not anno_path or not os.path.exists(anno_path):
+            continue
+        try:
+            with open(anno_path, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if not parts:
+                        continue
+                    try:
+                        gids.add(int(parts[0]))
+                    except (TypeError, ValueError):
+                        continue
+        except Exception:
+            continue
+    return gids
+
+
+def infer_fixed_roster_from_first_annotation_frame(annotations):
     if not annotations:
-        return None, None
+        return None, None, []
     first_frame = min(annotations.keys())
-    count = _count_valid_yolo_boxes(annotations.get(first_frame, []))
-    if count <= 0:
-        return first_frame, None
-    return first_frame, int(count)
+    anno_files = annotations.get(first_frame, [])
+    count = _count_valid_yolo_boxes(anno_files)
+    gids = sorted(_extract_yolo_gids(anno_files))
+    if count <= 0 or not gids:
+        return first_frame, None, []
+    return first_frame, int(count), gids
 
 
-def first_annotation_frame(annotations):
-    if not annotations:
-        return None
-    return min(annotations.keys())
-
-
-def keep_annotation_gids_only_on_initial_frame(detections, frame_id, initial_annotation_frame):
-    """
-    Keep annotation-provided global IDs only on the first annotated frame.
-    For subsequent annotated frames, keep boxes but drop annotation GID forcing.
-    """
-    if initial_annotation_frame is None or frame_id == initial_annotation_frame:
-        return detections
-    for d in detections:
-        if d.get('gid_source') == 'annotation':
-            d['gid_source'] = None
-            d['global_id'] = None
-    return detections
-
-
-def draw_tracks(img, tracks, max_tracks, connections, tracker_self):
+def draw_tracks(img, tracks, connections, tracker_self):
     """Draw tracks, keypoints and cross-view projections on a frame."""
-    valid_tracks = [t for t in tracks if t['missed'] <= tracker_self.max_missed]
+    valid_tracks = [t for t in tracks if t['missed'] == 0]
     
-    # Filter by active tracks only (missed == 0 and not deduced)
-    valid_tracks_filtered = []
-    for t in valid_tracks:
-        if t['missed'] == 0 and not t.get('was_deduced'):
-            valid_tracks_filtered.append(t)
-    
-    valid_tracks_filtered.sort(key=lambda x: x['global_id'])
-    
-    if max_tracks is not None:
-        valid_tracks_filtered = valid_tracks_filtered[:max_tracks]
+    valid_tracks.sort(key=lambda x: x['global_id'])
     
     # Draw tracks
-    for t in valid_tracks_filtered:
+    for t in valid_tracks:
         x1, y1, x2, y2 = map(int, t['bbox'])
         gid = t['global_id']
         col = (gid * 37 % 255, gid * 17 % 255, gid * 97 % 255)
         
-        thickness = 1 if (t.get('was_deduced') or t['missed'] > 0) else 2
+        thickness = 2
         cv.rectangle(img, (x1, y1), (x2, y2), col, thickness)
         
         # Label
         cx = (x1 + x2) // 2
         cy = y1
-        label = f'GID:{gid}' + (' (D)' if t.get('was_deduced') else '')
+        label = f'GID:{gid}'
         cv.putText(img, label, (cx, cy - 10), cv.FONT_HERSHEY_SIMPLEX, 0.6, col, 2)
         
         # Keypoints
@@ -291,6 +293,168 @@ def draw_cross_view_associations(img, associations, view_id):
     return img
 
 
+def _draw_projected_bottom_centers(
+    canvas,
+    items,
+    homography_to_canvas,
+    view_tag,
+    marker_type='circle',
+):
+    """Draw projected bbox bottom centers for one view on a destination canvas."""
+    if canvas is None or items is None:
+        return 0
+
+    h, w = canvas.shape[:2]
+    drawn = 0
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        bbox = item.get('bbox')
+        if bbox is None:
+            continue
+        # Skip stale track slots if this is a track list.
+        if int(item.get('missed', 0)) > 0:
+            continue
+
+        pt = _bbox_bottom_center(bbox)
+        if homography_to_canvas is not None:
+            pt = project_point_with_homography(pt, homography_to_canvas)
+        if pt is None or not np.all(np.isfinite(pt)):
+            continue
+
+        x = int(round(float(pt[0])))
+        y = int(round(float(pt[1])))
+        if x < 0 or x >= w or y < 0 or y >= h:
+            continue
+
+        gid = item.get('global_id')
+        if gid is None:
+            col = (0, 200, 255) if view_tag == 'V1' else (0, 255, 0)
+        else:
+            col = (
+                int(gid * 37 % 255),
+                int(gid * 17 % 255),
+                int(gid * 97 % 255),
+            )
+
+        if marker_type == 'cross':
+            cv.drawMarker(
+                canvas, (x, y), col,
+                markerType=cv.MARKER_TILTED_CROSS,
+                markerSize=12,
+                thickness=2
+            )
+        else:
+            cv.circle(canvas, (x, y), 5, col, -1)
+            cv.circle(canvas, (x, y), 6, (255, 255, 255), 1)
+
+        label_id = gid if gid is not None else item.get('track_id')
+        if label_id is not None:
+            cv.putText(
+                canvas, f'{view_tag}:{label_id}', (x + 6, y - 6),
+                cv.FONT_HERSHEY_SIMPLEX, 0.45, col, 1
+            )
+        drawn += 1
+
+    return drawn
+
+
+def _collect_projected_bottom_centers_by_gid(items, homography_to_canvas):
+    """Collect projected bbox bottom centers grouped by global ID."""
+    points_by_gid = {}
+    if items is None:
+        return points_by_gid
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if int(item.get('missed', 0)) > 0:
+            continue
+
+        gid = item.get('global_id')
+        bbox = item.get('bbox')
+        if gid is None or bbox is None:
+            continue
+
+        pt = _bbox_bottom_center(bbox)
+        if homography_to_canvas is not None:
+            pt = project_point_with_homography(pt, homography_to_canvas)
+        if pt is None or not np.all(np.isfinite(pt)):
+            continue
+
+        try:
+            gid = int(gid)
+        except (TypeError, ValueError):
+            continue
+        points_by_gid.setdefault(gid, []).append(
+            np.array([float(pt[0]), float(pt[1])], dtype=np.float32)
+        )
+
+    return points_by_gid
+
+
+def render_court_projection_frame(
+    court_template_img,
+    view1_items,
+    view2_items,
+    homography_view1_to_court,
+    homography_view2_to_court,
+    frame_id=None,
+):
+    """
+    Draw only shared tracks on the court template.
+
+    For each GID visible in both views, draw the midpoint between the two projected
+    bottom-center points (one from each view).
+    """
+    if court_template_img is None:
+        return None
+
+    out = court_template_img.copy()
+    h, w = out.shape[:2]
+
+    view1_points = _collect_projected_bottom_centers_by_gid(
+        view1_items, homography_view1_to_court
+    )
+    view2_points = _collect_projected_bottom_centers_by_gid(
+        view2_items, homography_view2_to_court
+    )
+
+    shared_gids = sorted(set(view1_points.keys()) & set(view2_points.keys()))
+    midpoint_count = 0
+
+    for gid in shared_gids:
+        p1 = np.mean(np.asarray(view1_points[gid], dtype=np.float32), axis=0)
+        p2 = np.mean(np.asarray(view2_points[gid], dtype=np.float32), axis=0)
+        midpoint = 0.5 * (p1 + p2)
+        if midpoint is None or not np.all(np.isfinite(midpoint)):
+            continue
+
+        x = int(round(float(midpoint[0])))
+        y = int(round(float(midpoint[1])))
+        if x < 0 or x >= w or y < 0 or y >= h:
+            continue
+
+        col = (
+            int(gid * 37 % 255),
+            int(gid * 17 % 255),
+            int(gid * 97 % 255),
+        )
+        cv.circle(out, (x, y), 6, col, -1)
+        cv.circle(out, (x, y), 7, (255, 255, 255), 1)
+        cv.putText(
+            out, f'GID:{gid}', (x + 7, y - 7),
+            cv.FONT_HERSHEY_SIMPLEX, 0.45, col, 1
+        )
+        midpoint_count += 1
+
+    if frame_id is not None:
+        draw_text_with_bg(out, f'Frame {int(frame_id)}', (20, 35))
+    draw_text_with_bg(out, f'Shared tracks: {midpoint_count}', (20, 70), scale=0.55)
+    return out
+
+
 def _build_association_lookup(associations):
     """Build per-track lookups for event logging in each view."""
     by_view1_track = {}
@@ -316,43 +480,20 @@ def _build_association_lookup(associations):
     return by_view1_track, by_view2_track
 
 
-def _compute_pose_attempt_metrics(detections):
-    attempts = []
-    for d in detections or []:
-        v = d.get('pose_attempts_used', 0)
-        try:
-            v = int(v)
-        except (TypeError, ValueError):
-            v = 0
-        attempts.append(max(0, v))
-
-    max_attempts = max(attempts) if attempts else 0
-    return {
-        'pose_ran_second_attempt': int(any(v > 1 for v in attempts)),
-        'pose_ran_more_than_second_attempt': int(any(v > 2 for v in attempts)),
-        'pose_max_attempts_used': int(max_attempts),
-    }
-
-
-def _augment_event_with_pose_attempts(event, pose_attempt_metrics):
-    event['pose_ran_second_attempt'] = int(pose_attempt_metrics.get('pose_ran_second_attempt', 0))
-    event['pose_ran_more_than_second_attempt'] = int(
-        pose_attempt_metrics.get('pose_ran_more_than_second_attempt', 0)
-    )
-    event['pose_max_attempts_used'] = int(pose_attempt_metrics.get('pose_max_attempts_used', 0))
-    return event
-
-
-def _augment_event_with_view_and_projected_pos(event, tracker, homography_to_other, association_info_by_track=None):
+def _augment_event_with_view_and_projected_pos(
+    event,
+    tracker,
+    homography_to_other,
+    association_info_by_track=None,
+    track_by_id=None,
+):
     """Attach own-view bottom center and projected point in the other view."""
     event['view_x'] = ''
     event['view_y'] = ''
     event['view_pos_json'] = ''
-    event['has_view_pos'] = 0
     event['projected_other_x'] = ''
     event['projected_other_y'] = ''
     event['projected_other_pos_json'] = ''
-    event['has_projected_other_pos'] = 0
     event['matched_with_other_view_track_id'] = ''
     event['assoc_projected_other_x'] = ''
     event['assoc_projected_other_y'] = ''
@@ -392,7 +533,11 @@ def _augment_event_with_view_and_projected_pos(event, tracker, homography_to_oth
         if assoc.get('distance_px') is not None:
             event['assoc_match_dist_px'] = float(assoc['distance_px'])
 
-    track = next((t for t in tracker.tracks if t.get('track_id') == tid), None)
+    track = None
+    if track_by_id is not None:
+        track = track_by_id.get(tid)
+    if track is None:
+        track = next((t for t in tracker.tracks if t.get('track_id') == tid), None)
     bbox = track.get('bbox') if track else None
     if bbox is None:
         return event
@@ -403,7 +548,6 @@ def _augment_event_with_view_and_projected_pos(event, tracker, homography_to_oth
         event['view_x'] = vx
         event['view_y'] = vy
         event['view_pos_json'] = json.dumps([vx, vy])
-        event['has_view_pos'] = 1
 
         if homography_to_other is not None:
             proj_pt = project_point_with_homography(view_pt, homography_to_other)
@@ -412,7 +556,6 @@ def _augment_event_with_view_and_projected_pos(event, tracker, homography_to_oth
                 event['projected_other_x'] = px
                 event['projected_other_y'] = py
                 event['projected_other_pos_json'] = json.dumps([px, py])
-                event['has_projected_other_pos'] = 1
     return event
 
 # ================= MAIN =================
@@ -430,38 +573,70 @@ def _bbox_intersection(a, b):
     return max(0, ix2 - ix1) * max(0, iy2 - iy1)
 
 
-def _suppress_nested_detections(detections, contain_thresh=0.9, area_ratio_thresh=0.6):
-    if len(detections) < 2:
+def _suppress_nested_detections(
+    detections,
+    overlap_thresh=0.9,
+):
+    n = len(detections)
+    if n < 2:
         return detections
-    keep = [True] * len(detections)
-    areas = [_bbox_area(d['bbox']) for d in detections]
-    for i in range(len(detections)):
+    keep = [True] * n
+    bboxes = [d['bbox'] for d in detections]
+    areas = [_bbox_area(b) for b in bboxes]
+    for i in range(n):
         if not keep[i]:
             continue
-        for j in range(len(detections)):
+        ai = areas[i]
+        if ai <= 0:
+            continue
+        bi = bboxes[i]
+        for j in range(n):
             if i == j or not keep[j]:
                 continue
-            if areas[i] <= 0 or areas[j] <= 0:
+            aj = areas[j]
+            if aj <= 0:
                 continue
             # Consider j nested in i
-            if areas[j] >= areas[i]:
+            if aj >= ai:
                 continue
-            inter = _bbox_intersection(detections[i]['bbox'], detections[j]['bbox'])
-            contain = inter / areas[j] if areas[j] > 0 else 0.0
-            area_ratio = areas[j] / areas[i]
-            if contain >= contain_thresh and area_ratio <= area_ratio_thresh:
-                # Prefer higher score; keep annotations
-                if detections[j].get('gid_source') == 'annotation':
-                    continue
-                if detections[j].get('score', 0.0) <= detections[i].get('score', 0.0):
-                    keep[j] = False
+            inter = _bbox_intersection(bi, bboxes[j])
+            overlap = inter / aj
+            if overlap >= overlap_thresh:
+                keep[j] = False
     return [d for d, k in zip(detections, keep) if k]
 
-def load_calibration(calib_path):
-    if not calib_path or not os.path.exists(calib_path):
-        return None
-    with open(calib_path, 'r') as f:
-        return json.load(f)
+
+def load_homography_matrix(homography_path, matrix_key='H'):
+    """Load a single 3x3 homography matrix from JSON."""
+    if not homography_path or not os.path.exists(homography_path):
+        raise FileNotFoundError(f"Homography file not found: {homography_path}")
+
+    with open(homography_path, 'r') as f:
+        data = json.load(f)
+
+    matrix = None
+    if isinstance(data, dict):
+        if matrix_key in data:
+            matrix = data[matrix_key]
+        elif 'H' in data:
+            matrix = data['H']
+        elif 'homography' in data:
+            matrix = data['homography']
+        elif 'matrix' in data:
+            matrix = data['matrix']
+    elif isinstance(data, list):
+        matrix = data
+
+    if matrix is None:
+        raise ValueError(
+            f"Homography file {homography_path} does not contain a matrix key "
+            f"('{matrix_key}', 'H', 'homography', or 'matrix')."
+        )
+
+    h = np.array(matrix, dtype=np.float32)
+    if h.shape != (3, 3):
+        raise ValueError(f"Invalid homography shape in {homography_path}: {h.shape}")
+    return h
 
 
 def load_homographies_for_views(homography_path):
@@ -625,17 +800,18 @@ def _filter_detections_above_lines(detections, lines, ref_pt):
 
 def detect_view(frame, frame_id, annotations, det_model,
                 sahi_conf_threshold, sahi_iou_threshold, slice_h, slice_w,
-                slice_overlap, pose_model, pose_attempts, pose_conf_threshold,
-                pose_iou_threshold, tracker,
-                suppress_nested=True, nested_contain_thresh=0.9, nested_area_ratio=0.6,
+                slice_overlap, pose_model, pose_conf_threshold,
+                pose_iou_threshold, world_homography=None,
+                nested_overlap_thresh=0.9,
                 invalid_if_above_lines=None, invalid_ref_pt=None):
     detections = []
     frame_h, frame_w = frame.shape[:2]
-    if frame_id in annotations:
+    using_annotations = frame_id in annotations
+    if using_annotations:
         for anno_file in annotations[frame_id]:
             detections.extend(parse_yolo_annotations(
-                anno_file, frame_w, frame_h, frame, pose_model, pose_attempts,
-                pose_conf_threshold, pose_iou_threshold, tracker=tracker
+                anno_file, frame_w, frame_h, frame, pose_model,
+                pose_conf_threshold, pose_iou_threshold, world_homography=world_homography
             ))
     else:
         preds = get_sliced_prediction(
@@ -651,30 +827,29 @@ def detect_view(frame, frame_id, annotations, det_model,
                     bx1, by1, bx2, by2 = map(int, p.bbox.to_xyxy())
                     bbox = (bx1, by1, bx2, by2)
                     appearance = compute_team_appearence(frame, bbox)
-                    world_pos = tracker.project_to_world(bbox)
                     detections.append({
                         'bbox': bbox,
                         'appearance': appearance,
-                        'world_pos': world_pos,
                         'score': p.score.value
                     })
 
-    if invalid_if_above_lines:
+    if (not using_annotations) and invalid_if_above_lines:
         detections = _filter_detections_above_lines(
             detections, invalid_if_above_lines, invalid_ref_pt
         )
 
-    if suppress_nested:
+
+    if not using_annotations:
         detections = _suppress_nested_detections(
             detections,
-            contain_thresh=nested_contain_thresh,
-            area_ratio_thresh=nested_area_ratio
+            overlap_thresh=nested_overlap_thresh,
         )
+
 
     for d in detections:
         if d.get('pose_attempts_used') is None:
             kpts, vec, attempts_used = process_detection_pose(
-                frame, d['bbox'], pose_model, pose_attempts,
+                frame, d['bbox'], pose_model,
                 pose_conf_threshold, pose_iou_threshold
             )
             d['keypoints'] = kpts
@@ -685,27 +860,156 @@ def detect_view(frame, frame_id, annotations, det_model,
                 d['pose_attempts_used'] = int(d['pose_attempts_used'])
             except (TypeError, ValueError):
                 d['pose_attempts_used'] = 0
-        # Force bbox-bottom-center anchoring for world coordinates.
-        d['world_pos'] = tracker.project_to_world(d['bbox']) if tracker else None
+        # Map to a shared reference plane (or keep native bottom-center if no homography).
+        if d.get('world_pos') is None:
+            d['world_pos'] = _bbox_to_reference_plane(d['bbox'], world_homography)
 
     return detections
 
 
-def merge_track_global_id(tracker, track, target_gid, frame_id, allow_target_conflict=False):
+def merge_track_global_id(tracker, track, target_gid, frame_id):
     if track['global_id'] == target_gid:
         return True
-    if hasattr(tracker, 'reassign_track_global_id'):
-        return bool(
-            tracker.reassign_track_global_id(
-                track, target_gid, frame_id, allow_target_conflict=allow_target_conflict
-            )
+    if not hasattr(tracker, 'reassign_track_global_id'):
+        return False
+    return bool(
+        tracker.reassign_track_global_id(
+            track, target_gid, frame_id
         )
-    tracker.merge_global_ids(track['global_id'], target_gid, frame_id)
-    return track.get('global_id') == target_gid
+    )
 
 
 def _bbox_bottom_center(bbox):
     return np.array([(bbox[0] + bbox[2]) / 2.0, bbox[3]], dtype=np.float32)
+
+
+def _bbox_to_reference_plane(bbox, homography_to_ref=None):
+    pt = _bbox_bottom_center(bbox)
+    if homography_to_ref is not None:
+        pt = project_point_with_homography(pt, homography_to_ref)
+    if pt is None or not np.all(np.isfinite(pt)):
+        return None
+    return np.array([float(pt[0]), float(pt[1]), 0.0], dtype=np.float32)
+
+
+def inject_reseed_hints_between_views(
+    detections_target,
+    tracker_source,
+    tracker_target,
+    homography_source_to_target,
+    max_projected_dist_px=35.0,
+    skip_gids_already_active_in_target=True,
+):
+    """
+    Inject GID hints into target detections using projected active tracks from source.
+    The hints are consumed only if a detection remains unmatched inside tracker2.update.
+    """
+    if (
+        not detections_target
+        or tracker_source is None
+        or tracker_target is None
+        or homography_source_to_target is None
+    ):
+        return 0
+
+    det_indices = [
+        j for j, d in enumerate(detections_target)
+        if d.get('bbox') is not None and d.get('global_id') is None
+    ]
+    if not det_indices:
+        return 0
+
+    active_target_gids = set()
+    if skip_gids_already_active_in_target:
+        active_target_gids = {
+            int(t.get('global_id'))
+            for t in tracker_target.tracks
+            if t.get('missed', 0) == 0 and t.get('global_id') is not None
+        }
+
+    source_points = []
+    source_gids = []
+    for ts in tracker_source.tracks:
+        if ts.get('missed', 0) != 0 or ts.get('bbox') is None:
+            continue
+        gid = ts.get('global_id')
+        if gid is None:
+            continue
+        gid = int(gid)
+        if gid in active_target_gids:
+            continue
+
+        p1 = _bbox_bottom_center(ts['bbox'])
+        p2 = project_point_with_homography(p1, homography_source_to_target)
+        if p2 is None or not np.all(np.isfinite(p2)):
+            continue
+
+        source_points.append(p2)
+        source_gids.append(gid)
+
+    if not source_points:
+        return 0
+
+    n_s = len(source_points)
+    n_d = len(det_indices)
+    very_large = float(max_projected_dist_px) + 1e6
+    cost = np.full((n_s, n_d), very_large, dtype=np.float32)
+
+    for i, proj_pt in enumerate(source_points):
+        for j, det_idx in enumerate(det_indices):
+            det_pt = _bbox_bottom_center(detections_target[det_idx]['bbox'])
+            if det_pt is None or not np.all(np.isfinite(det_pt)):
+                continue
+            dist = float(np.linalg.norm(proj_pt - det_pt))
+            if dist <= max_projected_dist_px:
+                cost[i, j] = dist
+
+    row_ind, col_ind = linear_sum_assignment(cost)
+    assigned = 0
+    for r, c in zip(row_ind, col_ind):
+        if float(cost[r, c]) > max_projected_dist_px:
+            continue
+        det_idx = det_indices[c]
+        detections_target[det_idx]['global_id'] = int(source_gids[r])
+        assigned += 1
+
+    return int(assigned)
+
+
+def inject_view2_reseed_hints_from_view1(
+    detections_view2,
+    tracker_view1,
+    tracker_view2,
+    homography_view1_to_view2,
+    max_projected_dist_px=35.0,
+):
+    return inject_reseed_hints_between_views(
+        detections_target=detections_view2,
+        tracker_source=tracker_view1,
+        tracker_target=tracker_view2,
+        homography_source_to_target=homography_view1_to_view2,
+        max_projected_dist_px=max_projected_dist_px,
+        skip_gids_already_active_in_target=True,
+    )
+
+
+def inject_view1_reseed_hints_from_view2(
+    detections_view1,
+    tracker_view2,
+    tracker_view1,
+    homography_view2_to_view1,
+    max_projected_dist_px=35.0,
+):
+    # Do not skip source GIDs that are already active in view1:
+    # this allows correction of in-view ID swaps (same IDs active on wrong people).
+    return inject_reseed_hints_between_views(
+        detections_target=detections_view1,
+        tracker_source=tracker_view2,
+        tracker_target=tracker_view1,
+        homography_source_to_target=homography_view2_to_view1,
+        max_projected_dist_px=max_projected_dist_px,
+        skip_gids_already_active_in_target=False,
+    )
 
 
 def associate_tracks_to_view1(
@@ -713,33 +1017,19 @@ def associate_tracks_to_view1(
     homography_anchor_to_other,
     homography_other_to_anchor=None,
     max_projected_dist_px=120.0,
-    sticky_gid_by_other_track=None,
-    only_visible_tracks=True,
 ):
-    # By default, consider only currently visible tracks to avoid lingering
+    # Consider only currently visible tracks to avoid lingering
     # cross-view points after occlusion/exit.
     # GID reassignment is applied only for confident occlusion recovery:
     # exactly one side was refound in this frame.
-    if only_visible_tracks:
-        active1 = [
-            t for t in tracker1.tracks
-            if t.get('bbox') is not None and t.get('missed', 0) == 0
-        ]
-        active_other = [
-            t for t in tracker_other.tracks
-            if t.get('bbox') is not None and t.get('missed', 0) == 0
-        ]
-    else:
-        max_missed_1 = int(getattr(tracker1, 'max_missed', 0))
-        max_missed_other = int(getattr(tracker_other, 'max_missed', 0))
-        active1 = [
-            t for t in tracker1.tracks
-            if t.get('bbox') is not None and t.get('missed', 0) <= max_missed_1
-        ]
-        active_other = [
-            t for t in tracker_other.tracks
-            if t.get('bbox') is not None and t.get('missed', 0) <= max_missed_other
-        ]
+    active1 = [
+        t for t in tracker1.tracks
+        if t.get('bbox') is not None and t.get('missed', 0) == 0
+    ]
+    active_other = [
+        t for t in tracker_other.tracks
+        if t.get('bbox') is not None and t.get('missed', 0) == 0
+    ]
     if not active1 or not active_other:
         return []
 
@@ -762,21 +1052,41 @@ def associate_tracks_to_view1(
     for i, p_proj in enumerate(projected_to_other):
         if p_proj is None or not np.all(np.isfinite(p_proj)):
             continue
-        gid1 = active1[i].get('global_id')
         for j, p_other in enumerate(native_view2):
             if p_other is None or not np.all(np.isfinite(p_other)):
                 continue
-            other_tid = active_other[j].get('track_id')
-            if sticky_gid_by_other_track is not None and other_tid is not None:
-                locked_gid = sticky_gid_by_other_track.get(other_tid)
-                if locked_gid is not None and locked_gid != gid1:
-                    continue
             dist = float(np.linalg.norm(p_proj - p_other))
             if dist <= max_projected_dist_px:
                 cost[i, j] = dist
 
     row_ind, col_ind = linear_sum_assignment(cost)
     associations = []
+
+    def _select_target_gid(t1, t2):
+        gid1 = t1.get('global_id')
+        gid2 = t2.get('global_id')
+
+        if gid1 is None and gid2 is None:
+            return None, False
+        if gid1 is None:
+            return gid2, True
+        if gid2 is None:
+            return gid1, True
+        if gid1 == gid2:
+            return gid1, False
+
+        refound1 = bool(t1.get('was_refound_in_this_frame'))
+        refound2 = bool(t2.get('was_refound_in_this_frame'))
+        # Reassign only for confident occlusion recovery:
+        # exactly one side was refound in this frame.
+        if refound2 and not refound1:
+            return gid1, True
+        if refound1 and not refound2:
+            return gid2, True
+
+        # Otherwise, keep existing identities and only report the association.
+        return None, False
+
     for r, c in zip(row_ind, col_ind):
         dist = float(cost[r, c])
         if dist > max_projected_dist_px:
@@ -784,36 +1094,23 @@ def associate_tracks_to_view1(
 
         t1 = active1[r]
         t2 = active_other[c]
-        gid1 = t1['global_id']
-        other_tid = t2.get('track_id')
+        gid1 = t1.get('global_id')
         gid2 = t2.get('global_id')
-        refound1 = bool(t1.get('was_refound_in_this_frame'))
-        refound2 = bool(t2.get('was_refound_in_this_frame'))
-
-        # Reassign only when one view refound the target and the other view
-        # has a stable identity in this frame.
-        target_gid = None
-        if refound1 and not refound2:
-            target_gid = gid2
-        elif refound2 and not refound1:
-            target_gid = gid1
+        target_gid, should_reassign = _select_target_gid(t1, t2)
 
         gid_reassigned = False
-        if target_gid is not None:
-            merged1 = merge_track_global_id(
-                tracker1, t1, target_gid, frame_id, allow_target_conflict=True
+        if should_reassign and target_gid is not None:
+            prev_gid1 = gid1
+            prev_gid2 = gid2
+            merge_track_global_id(
+                tracker1, t1, target_gid, frame_id
             )
-            merged2 = merge_track_global_id(
-                tracker_other, t2, target_gid, frame_id, allow_target_conflict=True
+            merge_track_global_id(
+                tracker_other, t2, target_gid, frame_id
             )
-            if merged1 and merged2:
-                gid_reassigned = True
-                if sticky_gid_by_other_track is not None and other_tid is not None:
-                    sticky_gid_by_other_track[other_tid] = target_gid
-                if refound1 and t2.get('gid_source') == 'annotation':
-                    t1['gid_source'] = 'annotation'
-                elif refound2 and t1.get('gid_source') == 'annotation':
-                    t2['gid_source'] = 'annotation'
+            gid1_now = t1.get('global_id')
+            gid2_now = t2.get('global_id')
+            gid_reassigned = int((prev_gid1 != gid1_now) or (prev_gid2 != gid2_now))
 
         p2 = projected_to_other[r]
         n1_pt = native_view1[r]
@@ -822,9 +1119,16 @@ def associate_tracks_to_view1(
         if homography_other_to_anchor is not None and n2_pt is not None and np.all(np.isfinite(n2_pt)):
             p1 = project_point_with_homography(n2_pt, homography_other_to_anchor)
 
-        assoc_gid = t1.get('global_id')
-        if assoc_gid is None:
-            assoc_gid = t2.get('global_id')
+        gid1_now = t1.get('global_id')
+        gid2_now = t2.get('global_id')
+        if gid1_now is None:
+            assoc_gid = gid2_now
+        elif gid2_now is None:
+            assoc_gid = gid1_now
+        elif gid1_now == gid2_now:
+            assoc_gid = gid1_now
+        else:
+            assoc_gid = None
         associations.append({
             'track_id_view1': t1.get('track_id'),
             'track_id_view2': t2.get('track_id'),
@@ -842,75 +1146,61 @@ def associate_tracks_to_view1(
 def yolo_sahi_pose_tracking(
     source1,
     source2,
-    calib_path1=None,
-    calib_path2=None,
     annotations_dir1=None,
     annotations_dir2=None,
     output_path1='output_view1.mp4',
     output_path2='output_view2.mp4',
     output_csv_path1='track_events_view1.csv',
     output_csv_path2='track_events_view2.csv',
-    enable_pose=True,
     size=(1440, 810),  # Processing resolution (display uses same max size).
     # detection View 1
-    sahi_conf_threshold1=0.43,
+    sahi_conf_threshold1=0.50,
     sahi_iou_threshold1=0.37,
-    slice_h1=480,
-    slice_w1=480,
+    slice_h1=320,
+    slice_w1=320,
     slice_overlap1=0.3,
     # pose View 1
     pose_conf_threshold1=0.03,
     pose_iou_threshold1=0.005,
     # tracker View 1
-    match_threshold1=0.45,
-    iou_weight1=0.55,
+    match_threshold1=0.55,
+    iou_weight1=0.60,
     appearance_weight1=0.35,
     pose_weight1=0.25,
     ema_alpha1=0.5,
-    max_velocity1=200.0,
-    nested_track_contain_thresh1=0.9,
-    nested_track_area_ratio1=0.6,
-    nested_track_app_sim1=0.7,
-    cross_view_max_dist_px1=120.0,
-    cross_view_only_visible_tracks=True,
-    max_missed_frames1=80,
+    max_velocity1=45.0,
+    cross_view_max_dist_px1=35.0,
     # detection View 2
-    sahi_conf_threshold2=0.55,
-    sahi_iou_threshold2=0.35,
-    slice_h2=640,
-    slice_w2=640,
-    slice_overlap2=0.15,
+    sahi_conf_threshold2=0.45,
+    sahi_iou_threshold2=0.40,
+    slice_h2=480,
+    slice_w2=480,
+    slice_overlap2=0.25,
     # pose View 2
     pose_conf_threshold2=0.10,
     pose_iou_threshold2=0.02,
-    pose_attempts2=(
-        {'pad': 0.0, 'conf': None, 'iou': None},
-        {'pad': 0.25, 'conf': 0.01, 'iou': 0.005},
-    ),
     # tracker View 2
-    match_threshold2=0.45,
-    iou_weight2=0.55,
+    match_threshold2=0.55,
+    iou_weight2=0.60,
     appearance_weight2=0.35,
     pose_weight2=0.05,
     ema_alpha2=0.5,
-    max_velocity2=300.0,
-    nested_track_contain_thresh2=0.9,
-    nested_track_area_ratio2=0.6,
-    nested_track_app_sim2=0.7,
-    max_missed_frames2=80,
+    max_velocity2=35.0,
+    enable_view1_reseed_from_view2=True,
+    enable_view2_reseed_from_view1=True,
     homography_path='homography_cam4_to_cam13.json',
-    nested_contain_thresh=0.9,
-    nested_area_ratio=0.68,
-    gid_pool_size=None,
-    gid_reuse_cooldown_frames=0,
-    sticky_cross_view_gid_lock=False,
-    fixed_slots_mode=False,
-    fixed_slots_count=None,
-    annotation_gid_first_frame_only=True,
+    nested_overlap_thresh1=0.8,
+    nested_overlap_thresh2=0.8,
     # line-based filtering + debug
     invalid_view1_line_ids=(12, 13, 14),
     court_lines_path1=None,
     court_corners_path1=None,
+    # optional projection video onto a court template image
+    save_court_projection=True,
+    court_template_path='basketball_court_template_by_verasthebrujah_ddm06jb-fullview.png',
+    homography_view1_to_court_path='homography_cam13_to_court.json',
+    homography_view2_to_court_path='homography_cam4_to_court.json',
+    output_court_projection_path='output_court_projection.mp4',
 ):
     """
     Multi-view tracking with single-view tracking + cross-view association.
@@ -919,6 +1209,7 @@ def yolo_sahi_pose_tracking(
     - Detect per-view and estimate pose
     - Track per-view independently
     - Associate tracks across views using homography-projected bottom centers
+    - Optionally project both views onto a shared court template and save a video
     """
     print("Starting FIXED yolo_sahi_pose_tracking")
     
@@ -935,102 +1226,70 @@ def yolo_sahi_pose_tracking(
         model_type='ultralytics',
         model_path='yolo11x.pt',
         confidence_threshold=min(sahi_conf_threshold1, sahi_conf_threshold2),
-        image_size=round_to_multiple(640, 32),
+        image_size=640,
         device='cuda:0'
     )
-    pose_model = YOLO('yolo11x-pose.pt') if enable_pose else None
+    pose_model = YOLO('yolo11x-pose.pt')
     print("Models loaded successfully")
-
-    # Load calibrations
-    calib1 = load_calibration(calib_path1)
-    calib2 = load_calibration(calib_path2)
 
     video_prefix1 = os.path.basename(source1).split('.')[0] if source1 else None
     video_prefix2 = os.path.basename(source2).split('.')[0] if source2 else None
 
-    # Load annotations early so fixed-slot initialization can infer roster size.
+    # Load first-frame annotations for both views (ground-truth bootstrap).
     annotations1 = load_annotations_from_dir(annotations_dir1, video_prefix1)
     annotations2 = load_annotations_from_dir(annotations_dir2, video_prefix2)
-    initial_annotation_frame1 = first_annotation_frame(annotations1)
-    initial_annotation_frame2 = first_annotation_frame(annotations2)
-    if annotation_gid_first_frame_only:
+
+    if 0 not in annotations1 or 0 not in annotations2:
+        raise ValueError(
+            "Both views must provide first-frame annotations for fixed-slot tracking."
+        )
+
+    first_frame1, count1, gid_values1 = infer_fixed_roster_from_first_annotation_frame(annotations1)
+    first_frame2, count2, gid_values2 = infer_fixed_roster_from_first_annotation_frame(annotations2)
+    if count1 is None or count2 is None:
+        raise ValueError("Failed to infer fixed roster from first-frame annotations in both views.")
+
+    gid_pool = sorted(set(gid_values1) | set(gid_values2))
+    if not gid_pool:
+        raise ValueError("Could not derive any Global IDs from first-frame annotations.")
+
+    fixed_slots_count = int(len(gid_pool))
+    print(
+        f"Fixed roster inferred from frame {first_frame1} (view1) and frame {first_frame2} (view2): "
+        f"{fixed_slots_count} IDs -> {gid_pool}"
+    )
+    if set(gid_values1) != set(gid_values2):
         print(
-            f"Annotation GID init-only mode: view1 first frame={initial_annotation_frame1}, "
-            f"view2 first frame={initial_annotation_frame2}"
+            "Warning: first-frame annotation IDs differ between views. "
+            "Using union of IDs for the fixed GID pool."
         )
 
-    if fixed_slots_mode:
-        slot_count = fixed_slots_count
-        if slot_count is None:
-            first_frame1, inferred1 = infer_slot_count_from_first_annotation_frame(annotations1)
-            if inferred1 is not None:
-                slot_count = inferred1
-                print(f"Fixed slots inferred from view1 frame {first_frame1}: {slot_count}")
-            else:
-                first_frame2, inferred2 = infer_slot_count_from_first_annotation_frame(annotations2)
-                if inferred2 is not None:
-                    slot_count = inferred2
-                    print(f"Fixed slots inferred from view2 frame {first_frame2}: {slot_count}")
-        if slot_count is None or int(slot_count) <= 0:
-            raise ValueError(
-                "fixed_slots_mode=True requires fixed_slots_count or valid first-frame annotations."
-            )
-        fixed_slots_count = int(slot_count)
-        print(f"Fixed slots mode enabled: {fixed_slots_count} slots per view")
-    else:
-        fixed_slots_count = None
+    shared_id_manager = GlobalIDManager(
+        gid_values=gid_pool,
+        cooldown_frames=0,
+    )
 
-    if gid_pool_size is None:
-        # Unlimited GID mode: do not use fixed-pool allocation/cooldown.
-        shared_id_manager = GlobalIDManager()
-    else:
-        shared_id_manager = GlobalIDManager(
-            pool_size=gid_pool_size,
-            cooldown_frames=max(0, int(gid_reuse_cooldown_frames)),
-        )
-    sticky_gid_view2 = {} if sticky_cross_view_gid_lock else None
-
-    # FIX: Create trackers with unified max_missed_frames and is_rectified=True
+    # Create trackers with per-view matching settings and shared fixed GID pool.
     tracker1 = IOUTracker(
         match_threshold=match_threshold1,
-        max_missed_frames=max_missed_frames1,  # Unified
         iou_weight=iou_weight1,
         appearance_weight=appearance_weight1,
         pose_weight=pose_weight1,
         ema_alpha=ema_alpha1,
         max_velocity=max_velocity1,
-        camera_params=calib1,
         global_id_manager=shared_id_manager,
         max_tracks=fixed_slots_count,
-        is_rectified=True,  # FIX: Videos are rectified
-        prune_tracks=not fixed_slots_mode,
-        fixed_slots_mode=fixed_slots_mode,
-        # Nested suppression is intentionally done only at detection stage (pre-tracker update).
-        suppress_nested_tracks=True,
-        nested_contain_thresh=nested_track_contain_thresh1,
-        nested_area_ratio=nested_track_area_ratio1,
-        nested_app_sim_thresh=nested_track_app_sim1
     )
     
     tracker2 = IOUTracker(
         match_threshold=match_threshold2,
-        max_missed_frames=max_missed_frames2,  # Unified
         iou_weight=iou_weight2,
         appearance_weight=appearance_weight2,
         pose_weight=pose_weight2,
         ema_alpha=ema_alpha2,
         max_velocity=max_velocity2,
-        camera_params=calib2,
         global_id_manager=shared_id_manager,
         max_tracks=fixed_slots_count,
-        is_rectified=True,  # FIX: Videos are rectified
-        prune_tracks=not fixed_slots_mode,
-        fixed_slots_mode=fixed_slots_mode,
-        # Nested suppression is intentionally done only at detection stage (pre-tracker update).
-        suppress_nested_tracks=True,
-        nested_contain_thresh=nested_track_contain_thresh2,
-        nested_area_ratio=nested_track_area_ratio2,
-        nested_app_sim_thresh=nested_track_app_sim2
     )
 
     h_view1_to_view2_raw, h_view2_to_view1_raw = load_homographies_for_views(homography_path)
@@ -1045,18 +1304,22 @@ def yolo_sahi_pose_tracking(
     fps1 = int(cap1.get(cv.CAP_PROP_FPS)) or 25
     fps2 = int(cap2.get(cv.CAP_PROP_FPS)) or 25
 
+    court_template_img = None
+    h_view1_to_court = None
+    h_view2_to_court = None
+    writer_court = None
+
     # Create CSV writers
     csv_file1 = open(output_csv_path1, 'w', newline='')
     csv_writer1 = csv.DictWriter(
         csv_file1,
         fieldnames=[
-            'frame', 'track_id', 'event', 'view', 'global_id',
+            'frame', 'track_id', 'event', 'global_id',
             'matched_with_other_view_track_id', 'new_global_id', 'old_global_id',
             'swapped_with_track_id',
             'detections_in_frame',
-            'pose_ran_second_attempt', 'pose_ran_more_than_second_attempt', 'pose_max_attempts_used',
-            'view_x', 'view_y', 'view_pos_json', 'has_view_pos',
-            'projected_other_x', 'projected_other_y', 'projected_other_pos_json', 'has_projected_other_pos',
+            'view_x', 'view_y', 'view_pos_json',
+            'projected_other_x', 'projected_other_y', 'projected_other_pos_json',
             'assoc_projected_other_x', 'assoc_projected_other_y', 'assoc_projected_other_pos_json', 'has_assoc_projected_other_pos',
             'assoc_native_other_x', 'assoc_native_other_y', 'assoc_native_other_pos_json', 'has_assoc_native_other_pos',
             'assoc_match_dist_px',
@@ -1068,13 +1331,12 @@ def yolo_sahi_pose_tracking(
     csv_writer2 = csv.DictWriter(
         csv_file2,
         fieldnames=[
-            'frame', 'track_id', 'event', 'view', 'global_id',
+            'frame', 'track_id', 'event', 'global_id',
             'matched_with_other_view_track_id', 'new_global_id', 'old_global_id',
             'swapped_with_track_id',
             'detections_in_frame',
-            'pose_ran_second_attempt', 'pose_ran_more_than_second_attempt', 'pose_max_attempts_used',
-            'view_x', 'view_y', 'view_pos_json', 'has_view_pos',
-            'projected_other_x', 'projected_other_y', 'projected_other_pos_json', 'has_projected_other_pos',
+            'view_x', 'view_y', 'view_pos_json',
+            'projected_other_x', 'projected_other_y', 'projected_other_pos_json',
             'assoc_projected_other_x', 'assoc_projected_other_y', 'assoc_projected_other_pos_json', 'has_assoc_projected_other_pos',
             'assoc_native_other_x', 'assoc_native_other_y', 'assoc_native_other_pos_json', 'has_assoc_native_other_pos',
             'assoc_match_dist_px',
@@ -1094,6 +1356,8 @@ def yolo_sahi_pose_tracking(
         print("Error: Could not read initial frames")
         cap1.release()
         cap2.release()
+        if writer_court is not None:
+            writer_court.release()
         csv_file1.close()
         csv_file2.close()
         return
@@ -1123,6 +1387,45 @@ def yolo_sahi_pose_tracking(
     writer1 = cv.VideoWriter(output_path1, cv.VideoWriter_fourcc(*'mp4v'), fps1, process_size)
     writer2 = cv.VideoWriter(output_path2, cv.VideoWriter_fourcc(*'mp4v'), fps2, process_size)
 
+    if save_court_projection and output_court_projection_path:
+        if not court_template_path or not os.path.exists(court_template_path):
+            raise FileNotFoundError(f"Court template image not found: {court_template_path}")
+
+        court_template_img = cv.imread(court_template_path)
+        if court_template_img is None:
+            raise RuntimeError(f"Failed to read court template image: {court_template_path}")
+
+        court_h, court_w = court_template_img.shape[:2]
+        h_view1_to_court_raw = load_homography_matrix(homography_view1_to_court_path, matrix_key='H')
+        h_view2_to_court_raw = load_homography_matrix(homography_view2_to_court_path, matrix_key='H')
+
+        # Homographies are estimated on original camera frames; scale them to processing size.
+        h_view1_to_court = scale_homography_for_resized_views(
+            h_view1_to_court_raw,
+            src_orig_size=(orig_w1, orig_h1),
+            dst_orig_size=(court_w, court_h),
+            src_proc_size=process_size,
+            dst_proc_size=(court_w, court_h),
+        )
+        h_view2_to_court = scale_homography_for_resized_views(
+            h_view2_to_court_raw,
+            src_orig_size=(orig_w2, orig_h2),
+            dst_orig_size=(court_w, court_h),
+            src_proc_size=process_size,
+            dst_proc_size=(court_w, court_h),
+        )
+
+        fps_court = min(fps1, fps2) if fps1 > 0 and fps2 > 0 else (fps1 or fps2 or 25)
+        writer_court = cv.VideoWriter(
+            output_court_projection_path,
+            cv.VideoWriter_fourcc(*'mp4v'),
+            fps_court,
+            (court_w, court_h),
+        )
+        if not writer_court.isOpened():
+            raise RuntimeError(f"Could not open court projection writer: {output_court_projection_path}")
+        print(f"Court projection video: {output_court_projection_path}")
+
     print(f"Processing initial frame {frame_id}")
 
     line_debug1 = []
@@ -1138,19 +1441,12 @@ def yolo_sahi_pose_tracking(
         invalid_ids = {int(v) for v in invalid_view1_line_ids}
         invalid_view1_lines = [l for l in line_debug1 if l['line_id'] in invalid_ids]
 
-    # View 1: force a single pose attempt using the former fallback settings.
-    pose_attempts_view1_runtime = (
-        {'pad': 0.25, 'conf': pose_conf_threshold1, 'iou': pose_iou_threshold1},
-    )
-
     initial_detections1 = detect_view(
         frame1, frame_id, annotations1, det_model,
         sahi_conf_threshold1, sahi_iou_threshold1, slice_h1, slice_w1,
-        slice_overlap1, pose_model, pose_attempts_view1_runtime, pose_conf_threshold1,
-        pose_iou_threshold1, tracker1,
-        suppress_nested=True,
-        nested_contain_thresh=nested_contain_thresh,
-        nested_area_ratio=nested_area_ratio,
+        slice_overlap1, pose_model, pose_conf_threshold1,
+        pose_iou_threshold1, world_homography=None,
+        nested_overlap_thresh=nested_overlap_thresh1,
         invalid_if_above_lines=invalid_view1_lines,
         invalid_ref_pt=invalid_view1_ref_pt
     )
@@ -1158,74 +1454,83 @@ def yolo_sahi_pose_tracking(
     initial_detections2 = detect_view(
         frame2, frame_id, annotations2, det_model,
         sahi_conf_threshold2, sahi_iou_threshold2, slice_h2, slice_w2,
-        slice_overlap2, pose_model, pose_attempts2, pose_conf_threshold2,
-        pose_iou_threshold2, tracker2,
-        suppress_nested=True,
-        nested_contain_thresh=nested_contain_thresh,
-        nested_area_ratio=nested_area_ratio
+        slice_overlap2, pose_model, pose_conf_threshold2,
+        pose_iou_threshold2, world_homography=h_view2_to_view1,
+        nested_overlap_thresh=nested_overlap_thresh2,
     )
-    if annotation_gid_first_frame_only:
-        initial_detections1 = keep_annotation_gids_only_on_initial_frame(
-            initial_detections1, frame_id, initial_annotation_frame1
-        )
-        initial_detections2 = keep_annotation_gids_only_on_initial_frame(
-            initial_detections2, frame_id, initial_annotation_frame2
-        )
 
     # Update trackers with initial detections
+    if enable_view1_reseed_from_view2:
+        inject_view1_reseed_hints_from_view2(
+            initial_detections1,
+            tracker2,
+            tracker1,
+            h_view2_to_view1,
+            max_projected_dist_px=cross_view_max_dist_px1,
+        )
     tracks1 = tracker1.update(
-        initial_detections1, frame_id, finalize=True,
-        resolve_conflicts=((not fixed_slots_mode) and (frame_id not in annotations1))
+        initial_detections1, frame_id,
     )[0]
+    if enable_view2_reseed_from_view1:
+        inject_view2_reseed_hints_from_view1(
+            initial_detections2,
+            tracker1,
+            tracker2,
+            h_view1_to_view2,
+            max_projected_dist_px=cross_view_max_dist_px1,
+        )
     tracks2 = tracker2.update(
-        initial_detections2, frame_id, finalize=True,
-        resolve_conflicts=((not fixed_slots_mode) and (frame_id not in annotations2))
+        initial_detections2, frame_id,
     )[0]
-    if sticky_gid_view2 is not None:
-        active_view2_tids = {t.get('track_id') for t in tracker2.tracks}
-        stale_keys = [tid for tid in sticky_gid_view2.keys() if tid not in active_view2_tids]
-        for tid in stale_keys:
-            del sticky_gid_view2[tid]
     # Associate tracks across views (one-way: View 1 -> View 2)
     cross_view_associations = associate_tracks_to_view1(
         tracker1, tracker2, frame_id,
         homography_anchor_to_other=h_view1_to_view2,
         homography_other_to_anchor=h_view2_to_view1,
         max_projected_dist_px=cross_view_max_dist_px1,
-        sticky_gid_by_other_track=sticky_gid_view2,
-        only_visible_tracks=cross_view_only_visible_tracks,
     )
     assoc_lookup_view1, assoc_lookup_view2 = _build_association_lookup(cross_view_associations)
-    pose_metrics_view1 = _compute_pose_attempt_metrics(initial_detections1)
-    pose_metrics_view2 = _compute_pose_attempt_metrics(initial_detections2)
 
     # Log initial events
+    track_map1 = {t.get('track_id'): t for t in tracker1.tracks if t.get('track_id') is not None}
+    track_map2 = {t.get('track_id'): t for t in tracker2.tracks if t.get('track_id') is not None}
     for event in tracker1.get_frame_events():
-        event['view'] = 1
         event['detections_in_frame'] = len(initial_detections1)
-        _augment_event_with_pose_attempts(event, pose_metrics_view1)
         _augment_event_with_view_and_projected_pos(
-            event, tracker1, h_view1_to_view2, association_info_by_track=assoc_lookup_view1
+            event, tracker1, h_view1_to_view2,
+            association_info_by_track=assoc_lookup_view1,
+            track_by_id=track_map1,
         )
         csv_writer1.writerow(event)
     for event in tracker2.get_frame_events():
-        event['view'] = 2
         event['detections_in_frame'] = len(initial_detections2)
-        _augment_event_with_pose_attempts(event, pose_metrics_view2)
         _augment_event_with_view_and_projected_pos(
-            event, tracker2, h_view2_to_view1, association_info_by_track=assoc_lookup_view2
+            event, tracker2, h_view2_to_view1,
+            association_info_by_track=assoc_lookup_view2,
+            track_by_id=track_map2,
         )
         csv_writer2.writerow(event)
 
     # Save first frame
     roi1 = frame1
     roi2 = frame2
-    out1 = draw_tracks(roi1.copy(), tracks1, None, connections, tracker1)
-    out2 = draw_tracks(roi2.copy(), tracks2, None, connections, tracker2)
+    out1 = draw_tracks(roi1.copy(), tracks1, connections, tracker1)
+    out2 = draw_tracks(roi2.copy(), tracks2, connections, tracker2)
     out1 = draw_cross_view_associations(out1, cross_view_associations, view_id=1)
     out2 = draw_cross_view_associations(out2, cross_view_associations, view_id=2)
     writer1.write(out1)
     writer2.write(out2)
+    if writer_court is not None:
+        court_frame = render_court_projection_frame(
+            court_template_img,
+            tracks1,
+            tracks2,
+            h_view1_to_court,
+            h_view2_to_court,
+            frame_id=frame_id,
+        )
+        if court_frame is not None:
+            writer_court.write(court_frame)
     
 
     frame_id += 1
@@ -1248,75 +1553,69 @@ def yolo_sahi_pose_tracking(
         detections1 = detect_view(
             frame1, frame_id, annotations1, det_model,
             sahi_conf_threshold1, sahi_iou_threshold1, slice_h1, slice_w1,
-            slice_overlap1, pose_model, pose_attempts_view1_runtime, pose_conf_threshold1,
-            pose_iou_threshold1, tracker1,
-            suppress_nested=True,
-            nested_contain_thresh=nested_contain_thresh,
-            nested_area_ratio=nested_area_ratio,
+            slice_overlap1, pose_model, pose_conf_threshold1,
+            pose_iou_threshold1, world_homography=None,
+            nested_overlap_thresh=nested_overlap_thresh1,
             invalid_if_above_lines=invalid_view1_lines,
             invalid_ref_pt=invalid_view1_ref_pt
         )
         detections2 = detect_view(
             frame2, frame_id, annotations2, det_model,
             sahi_conf_threshold2, sahi_iou_threshold2, slice_h2, slice_w2,
-            slice_overlap2, pose_model, pose_attempts2, pose_conf_threshold2,
-            pose_iou_threshold2, tracker2,
-            suppress_nested=True,
-            nested_contain_thresh=nested_contain_thresh,
-            nested_area_ratio=nested_area_ratio
+            slice_overlap2, pose_model, pose_conf_threshold2,
+            pose_iou_threshold2, world_homography=h_view2_to_view1,
+            nested_overlap_thresh=nested_overlap_thresh2,
         )
-        if annotation_gid_first_frame_only:
-            detections1 = keep_annotation_gids_only_on_initial_frame(
-                detections1, frame_id, initial_annotation_frame1
+        # ===== STEP 4: UPDATE TRACKERS =====
+        if enable_view1_reseed_from_view2:
+            inject_view1_reseed_hints_from_view2(
+                detections1,
+                tracker2,
+                tracker1,
+                h_view2_to_view1,
+                max_projected_dist_px=cross_view_max_dist_px1,
             )
-            detections2 = keep_annotation_gids_only_on_initial_frame(
-                detections2, frame_id, initial_annotation_frame2
-            )
-        # ===== STEP 4: UPDATE TRACKERS (finalize=True) =====
         tracks1 = tracker1.update(
-            detections1, frame_id, finalize=True,
-            resolve_conflicts=((not fixed_slots_mode) and (frame_id not in annotations1))
+            detections1, frame_id,
         )[0]
+        if enable_view2_reseed_from_view1:
+            inject_view2_reseed_hints_from_view1(
+                detections2,
+                tracker1,
+                tracker2,
+                h_view1_to_view2,
+                max_projected_dist_px=cross_view_max_dist_px1,
+            )
         tracks2 = tracker2.update(
-            detections2, frame_id, finalize=True,
-            resolve_conflicts=((not fixed_slots_mode) and (frame_id not in annotations2))
+            detections2, frame_id,
         )[0]
-        if sticky_gid_view2 is not None:
-            active_view2_tids = {t.get('track_id') for t in tracker2.tracks}
-            stale_keys = [tid for tid in sticky_gid_view2.keys() if tid not in active_view2_tids]
-            for tid in stale_keys:
-                del sticky_gid_view2[tid]
         # ===== STEP 5: CROSS-VIEW ASSOCIATION (ONE-WAY: VIEW 1 -> VIEW 2) =====
         cross_view_associations = associate_tracks_to_view1(
             tracker1, tracker2, frame_id,
             homography_anchor_to_other=h_view1_to_view2,
             homography_other_to_anchor=h_view2_to_view1,
             max_projected_dist_px=cross_view_max_dist_px1,
-            sticky_gid_by_other_track=sticky_gid_view2,
-            only_visible_tracks=cross_view_only_visible_tracks,
         )
         assoc_lookup_view1, assoc_lookup_view2 = _build_association_lookup(cross_view_associations)
-        pose_metrics_view1 = _compute_pose_attempt_metrics(detections1)
-        pose_metrics_view2 = _compute_pose_attempt_metrics(detections2)
 
         # ===== LOG EVENTS =====
+        track_map1 = {t.get('track_id'): t for t in tracker1.tracks if t.get('track_id') is not None}
+        track_map2 = {t.get('track_id'): t for t in tracker2.tracks if t.get('track_id') is not None}
         for event in tracker1.get_frame_events():
-            if 'view' not in event:
-                event['view'] = 1
             event['detections_in_frame'] = len(detections1)
-            _augment_event_with_pose_attempts(event, pose_metrics_view1)
             _augment_event_with_view_and_projected_pos(
-                event, tracker1, h_view1_to_view2, association_info_by_track=assoc_lookup_view1
+                event, tracker1, h_view1_to_view2,
+                association_info_by_track=assoc_lookup_view1,
+                track_by_id=track_map1,
             )
             csv_writer1.writerow(event)
         
         for event in tracker2.get_frame_events():
-            if 'view' not in event:
-                event['view'] = 2
             event['detections_in_frame'] = len(detections2)
-            _augment_event_with_pose_attempts(event, pose_metrics_view2)
             _augment_event_with_view_and_projected_pos(
-                event, tracker2, h_view2_to_view1, association_info_by_track=assoc_lookup_view2
+                event, tracker2, h_view2_to_view1,
+                association_info_by_track=assoc_lookup_view2,
+                track_by_id=track_map2,
             )
             csv_writer2.writerow(event)
 
@@ -1327,8 +1626,8 @@ def yolo_sahi_pose_tracking(
         # ===== DRAWING =====
         roi1 = frame1
         roi2 = frame2
-        out1 = draw_tracks(roi1.copy(), tracks1, None, connections, tracker1)
-        out2 = draw_tracks(roi2.copy(), tracks2, None, connections, tracker2)
+        out1 = draw_tracks(roi1.copy(), tracks1, connections, tracker1)
+        out2 = draw_tracks(roi2.copy(), tracks2, connections, tracker2)
         out1 = draw_cross_view_associations(out1, cross_view_associations, view_id=1)
         out2 = draw_cross_view_associations(out2, cross_view_associations, view_id=2)
 
@@ -1343,6 +1642,17 @@ def yolo_sahi_pose_tracking(
 
         writer1.write(out1)
         writer2.write(out2)
+        if writer_court is not None:
+            court_frame = render_court_projection_frame(
+                court_template_img,
+                tracks1,
+                tracks2,
+                h_view1_to_court,
+                h_view2_to_court,
+                frame_id=frame_id,
+            )
+            if court_frame is not None:
+                writer_court.write(court_frame)
 
         disp1 = resize_for_display(out1, max_width=size[0], max_height=size[1])
         disp2 = resize_for_display(out2, max_width=size[0], max_height=size[1])
@@ -1360,6 +1670,8 @@ def yolo_sahi_pose_tracking(
     
     writer1.release()
     writer2.release()
+    if writer_court is not None:
+        writer_court.release()
     
     cv.destroyAllWindows()
 
@@ -1374,16 +1686,17 @@ if __name__ == '__main__':
         yolo_sahi_pose_tracking(
             source1='Tracking/material4project/Rectified videos/tracking_12/out13.mp4',
             source2='Tracking/material4project/Rectified videos/tracking_12/out4.mp4',
-            calib_path1='Tracking/material4project/3D Tracking Material/camera_data_with_Rvecs_2ndversion/camera_data/cam_13/calib/camera_calib.json',
-            calib_path2='Tracking/material4project/3D Tracking Material/camera_data_with_Rvecs_2ndversion/camera_data/cam_4/calib/camera_calib.json',
             annotations_dir1='tracking_12.v4i.yolov11/train/labels/',
             annotations_dir2='tracking_12.v4i.yolov11/train/labels/',
             output_path1='output_view1.mp4',
             output_path2='output_view2.mp4',
-            enable_pose=True,
-            fixed_slots_mode=True,
             court_lines_path1='court_lines_cam13.json',
             court_corners_path1='cam13_img_corners_rectified.json',
+            save_court_projection=True,
+            court_template_path='basketball_court_template_by_verasthebrujah_ddm06jb-fullview.png',
+            homography_view1_to_court_path='homography_cam13_to_court.json',
+            homography_view2_to_court_path='homography_cam4_to_court.json',
+            output_court_projection_path='output_court_projection.mp4',
         )
     except Exception as e:
         print(f"Error during execution: {e}")
