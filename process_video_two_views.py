@@ -891,126 +891,7 @@ def _bbox_to_reference_plane(bbox, homography_to_ref=None):
         return None
     return np.array([float(pt[0]), float(pt[1]), 0.0], dtype=np.float32)
 
-
-def inject_reseed_hints_between_views(
-    detections_target,
-    tracker_source,
-    tracker_target,
-    homography_source_to_target,
-    max_projected_dist_px=35.0,
-    skip_gids_already_active_in_target=True,
-):
-    """
-    Inject GID hints into target detections using projected active tracks from source.
-    The hints are consumed only if a detection remains unmatched inside tracker2.update.
-    """
-    if (
-        not detections_target
-        or tracker_source is None
-        or tracker_target is None
-        or homography_source_to_target is None
-    ):
-        return 0
-
-    det_indices = [
-        j for j, d in enumerate(detections_target)
-        if d.get('bbox') is not None and d.get('global_id') is None
-    ]
-    if not det_indices:
-        return 0
-
-    active_target_gids = set()
-    if skip_gids_already_active_in_target:
-        active_target_gids = {
-            int(t.get('global_id'))
-            for t in tracker_target.tracks
-            if t.get('missed', 0) == 0 and t.get('global_id') is not None
-        }
-
-    source_points = []
-    source_gids = []
-    for ts in tracker_source.tracks:
-        if ts.get('missed', 0) != 0 or ts.get('bbox') is None:
-            continue
-        gid = ts.get('global_id')
-        if gid is None:
-            continue
-        gid = int(gid)
-        if gid in active_target_gids:
-            continue
-
-        p1 = _bbox_bottom_center(ts['bbox'])
-        p2 = project_point_with_homography(p1, homography_source_to_target)
-        if p2 is None or not np.all(np.isfinite(p2)):
-            continue
-
-        source_points.append(p2)
-        source_gids.append(gid)
-
-    if not source_points:
-        return 0
-
-    n_s = len(source_points)
-    n_d = len(det_indices)
-    very_large = float(max_projected_dist_px) + 1e6
-    cost = np.full((n_s, n_d), very_large, dtype=np.float32)
-
-    for i, proj_pt in enumerate(source_points):
-        for j, det_idx in enumerate(det_indices):
-            det_pt = _bbox_bottom_center(detections_target[det_idx]['bbox'])
-            if det_pt is None or not np.all(np.isfinite(det_pt)):
-                continue
-            dist = float(np.linalg.norm(proj_pt - det_pt))
-            if dist <= max_projected_dist_px:
-                cost[i, j] = dist
-
-    row_ind, col_ind = linear_sum_assignment(cost)
-    assigned = 0
-    for r, c in zip(row_ind, col_ind):
-        if float(cost[r, c]) > max_projected_dist_px:
-            continue
-        det_idx = det_indices[c]
-        detections_target[det_idx]['global_id'] = int(source_gids[r])
-        assigned += 1
-
-    return int(assigned)
-
-
-def inject_view2_reseed_hints_from_view1(
-    detections_view2,
-    tracker_view1,
-    tracker_view2,
-    homography_view1_to_view2,
-    max_projected_dist_px=35.0,
-):
-    return inject_reseed_hints_between_views(
-        detections_target=detections_view2,
-        tracker_source=tracker_view1,
-        tracker_target=tracker_view2,
-        homography_source_to_target=homography_view1_to_view2,
-        max_projected_dist_px=max_projected_dist_px,
-        skip_gids_already_active_in_target=True,
-    )
-
-
-def inject_view1_reseed_hints_from_view2(
-    detections_view1,
-    tracker_view2,
-    tracker_view1,
-    homography_view2_to_view1,
-    max_projected_dist_px=35.0,
-):
-    # Do not skip source GIDs that are already active in view1:
-    # this allows correction of in-view ID swaps (same IDs active on wrong people).
-    return inject_reseed_hints_between_views(
-        detections_target=detections_view1,
-        tracker_source=tracker_view2,
-        tracker_target=tracker_view1,
-        homography_source_to_target=homography_view2_to_view1,
-        max_projected_dist_px=max_projected_dist_px,
-        skip_gids_already_active_in_target=False,
-    )
-
+# TO DO: maybe consider keeping the oldest GID in cross-view match when both are not refound, instead of keeping GID from view 1
 
 def associate_tracks_to_view1(
     tracker1, tracker_other, frame_id,
@@ -1020,8 +901,9 @@ def associate_tracks_to_view1(
 ):
     # Consider only currently visible tracks to avoid lingering
     # cross-view points after occlusion/exit.
-    # GID reassignment is applied only for confident occlusion recovery:
-    # exactly one side was refound in this frame.
+    # GID reassignment is primarily based on projected-point association.
+    # Refound flags are still used as a preference signal, but mismatched IDs
+    # are now reconciled even when both sides are continuously visible.
     active1 = [
         t for t in tracker1.tracks
         if t.get('bbox') is not None and t.get('missed', 0) == 0
@@ -1077,15 +959,15 @@ def associate_tracks_to_view1(
 
         refound1 = bool(t1.get('was_refound_in_this_frame'))
         refound2 = bool(t2.get('was_refound_in_this_frame'))
-        # Reassign only for confident occlusion recovery:
-        # exactly one side was refound in this frame.
+        # Prefer the side that stayed stable when only one side refound.
         if refound2 and not refound1:
             return gid1, True
         if refound1 and not refound2:
             return gid2, True
 
-        # Otherwise, keep existing identities and only report the association.
-        return None, False
+        # Otherwise, enforce cross-view ID consistency on associated pairs
+        # using view1 as anchor in this one-way association pass.
+        return gid1, True
 
     for r, c in zip(row_ind, col_ind):
         dist = float(cost[r, c])
@@ -1165,29 +1047,27 @@ def yolo_sahi_pose_tracking(
     # tracker View 1
     match_threshold1=0.55,
     iou_weight1=0.60,
-    appearance_weight1=0.35,
+    appearance_weight1=0.40,
     pose_weight1=0.25,
     ema_alpha1=0.5,
-    max_velocity1=45.0,
+    max_velocity1=35.0,
     cross_view_max_dist_px1=35.0,
     # detection View 2
     sahi_conf_threshold2=0.45,
-    sahi_iou_threshold2=0.40,
+    sahi_iou_threshold2=0.50,
     slice_h2=480,
     slice_w2=480,
     slice_overlap2=0.25,
     # pose View 2
-    pose_conf_threshold2=0.10,
+    pose_conf_threshold2=0.10, 
     pose_iou_threshold2=0.02,
     # tracker View 2
-    match_threshold2=0.55,
-    iou_weight2=0.60,
+    match_threshold2=0.45,
+    iou_weight2=0.55,
     appearance_weight2=0.35,
-    pose_weight2=0.05,
+    pose_weight2=0.15,
     ema_alpha2=0.5,
     max_velocity2=35.0,
-    enable_view1_reseed_from_view2=True,
-    enable_view2_reseed_from_view1=True,
     homography_path='homography_cam4_to_cam13.json',
     nested_overlap_thresh1=0.8,
     nested_overlap_thresh2=0.8,
@@ -1460,25 +1340,9 @@ def yolo_sahi_pose_tracking(
     )
 
     # Update trackers with initial detections
-    if enable_view1_reseed_from_view2:
-        inject_view1_reseed_hints_from_view2(
-            initial_detections1,
-            tracker2,
-            tracker1,
-            h_view2_to_view1,
-            max_projected_dist_px=cross_view_max_dist_px1,
-        )
     tracks1 = tracker1.update(
         initial_detections1, frame_id,
     )[0]
-    if enable_view2_reseed_from_view1:
-        inject_view2_reseed_hints_from_view1(
-            initial_detections2,
-            tracker1,
-            tracker2,
-            h_view1_to_view2,
-            max_projected_dist_px=cross_view_max_dist_px1,
-        )
     tracks2 = tracker2.update(
         initial_detections2, frame_id,
     )[0]
@@ -1567,25 +1431,9 @@ def yolo_sahi_pose_tracking(
             nested_overlap_thresh=nested_overlap_thresh2,
         )
         # ===== STEP 4: UPDATE TRACKERS =====
-        if enable_view1_reseed_from_view2:
-            inject_view1_reseed_hints_from_view2(
-                detections1,
-                tracker2,
-                tracker1,
-                h_view2_to_view1,
-                max_projected_dist_px=cross_view_max_dist_px1,
-            )
         tracks1 = tracker1.update(
             detections1, frame_id,
         )[0]
-        if enable_view2_reseed_from_view1:
-            inject_view2_reseed_hints_from_view1(
-                detections2,
-                tracker1,
-                tracker2,
-                h_view1_to_view2,
-                max_projected_dist_px=cross_view_max_dist_px1,
-            )
         tracks2 = tracker2.update(
             detections2, frame_id,
         )[0]
