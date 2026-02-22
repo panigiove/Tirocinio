@@ -72,20 +72,6 @@ def draw_text_with_bg(img, text, pos, scale=0.6):
     cv.putText(img, text, (x + 10, y), font, scale, (255, 255, 255), 2)
 
 
-def resize_for_display(img, max_width=1280, max_height=720):
-    if img is None:
-        return img
-    h, w = img.shape[:2]
-    if w <= 0 or h <= 0:
-        return img
-    scale = min(max_width / float(w), max_height / float(h), 1.0)
-    if scale >= 1.0:
-        return img
-    out_w = max(1, int(round(w * scale)))
-    out_h = max(1, int(round(h * scale)))
-    return cv.resize(img, (out_w, out_h), interpolation=cv.INTER_AREA)
-
-
 def parse_yolo_annotations(anno_file, img_width, img_height, frame, pose_model,
                           pose_conf_threshold, pose_iou_threshold, world_homography=None):
     """Parse YOLO format annotations from file."""
@@ -293,73 +279,6 @@ def draw_cross_view_associations(img, associations, view_id):
     return img
 
 
-def _draw_projected_bottom_centers(
-    canvas,
-    items,
-    homography_to_canvas,
-    view_tag,
-    marker_type='circle',
-):
-    """Draw projected bbox bottom centers for one view on a destination canvas."""
-    if canvas is None or items is None:
-        return 0
-
-    h, w = canvas.shape[:2]
-    drawn = 0
-
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        bbox = item.get('bbox')
-        if bbox is None:
-            continue
-        # Skip stale track slots if this is a track list.
-        if int(item.get('missed', 0)) > 0:
-            continue
-
-        pt = _bbox_bottom_center(bbox)
-        if homography_to_canvas is not None:
-            pt = project_point_with_homography(pt, homography_to_canvas)
-        if pt is None or not np.all(np.isfinite(pt)):
-            continue
-
-        x = int(round(float(pt[0])))
-        y = int(round(float(pt[1])))
-        if x < 0 or x >= w or y < 0 or y >= h:
-            continue
-
-        gid = item.get('global_id')
-        if gid is None:
-            col = (0, 200, 255) if view_tag == 'V1' else (0, 255, 0)
-        else:
-            col = (
-                int(gid * 37 % 255),
-                int(gid * 17 % 255),
-                int(gid * 97 % 255),
-            )
-
-        if marker_type == 'cross':
-            cv.drawMarker(
-                canvas, (x, y), col,
-                markerType=cv.MARKER_TILTED_CROSS,
-                markerSize=12,
-                thickness=2
-            )
-        else:
-            cv.circle(canvas, (x, y), 5, col, -1)
-            cv.circle(canvas, (x, y), 6, (255, 255, 255), 1)
-
-        label_id = gid if gid is not None else item.get('track_id')
-        if label_id is not None:
-            cv.putText(
-                canvas, f'{view_tag}:{label_id}', (x + 6, y - 6),
-                cv.FONT_HERSHEY_SIMPLEX, 0.45, col, 1
-            )
-        drawn += 1
-
-    return drawn
-
-
 def _collect_projected_bottom_centers_by_gid(items, homography_to_canvas):
     """Collect projected bbox bottom centers grouped by global ID."""
     points_by_gid = {}
@@ -403,10 +322,11 @@ def render_court_projection_frame(
     frame_id=None,
 ):
     """
-    Draw only shared tracks on the court template.
+    Draw shared and single-view tracks on the court template.
 
-    For each GID visible in both views, draw the midpoint between the two projected
-    bottom-center points (one from each view).
+    - Shared GIDs (visible in both views): draw midpoint between view projections.
+    - V1-only / V2-only GIDs: draw the projected point from the available view
+      with a distinct marker style.
     """
     if court_template_img is None:
         return None
@@ -421,20 +341,31 @@ def render_court_projection_frame(
         view2_items, homography_view2_to_court
     )
 
-    shared_gids = sorted(set(view1_points.keys()) & set(view2_points.keys()))
+    view1_gids = set(view1_points.keys())
+    view2_gids = set(view2_points.keys())
+    shared_gids = sorted(view1_gids & view2_gids)
+    only_view1_gids = sorted(view1_gids - view2_gids)
+    only_view2_gids = sorted(view2_gids - view1_gids)
+
+    def _to_canvas_xy(pt):
+        if pt is None or not np.all(np.isfinite(pt)):
+            return None
+        x = int(round(float(pt[0])))
+        y = int(round(float(pt[1])))
+        if x < 0 or x >= w or y < 0 or y >= h:
+            return None
+        return x, y
+
     midpoint_count = 0
 
     for gid in shared_gids:
         p1 = np.mean(np.asarray(view1_points[gid], dtype=np.float32), axis=0)
         p2 = np.mean(np.asarray(view2_points[gid], dtype=np.float32), axis=0)
         midpoint = 0.5 * (p1 + p2)
-        if midpoint is None or not np.all(np.isfinite(midpoint)):
+        xy = _to_canvas_xy(midpoint)
+        if xy is None:
             continue
-
-        x = int(round(float(midpoint[0])))
-        y = int(round(float(midpoint[1])))
-        if x < 0 or x >= w or y < 0 or y >= h:
-            continue
+        x, y = xy
 
         col = (
             int(gid * 37 % 255),
@@ -449,9 +380,60 @@ def render_court_projection_frame(
         )
         midpoint_count += 1
 
+    only_view1_count = 0
+    for gid in only_view1_gids:
+        p1 = np.mean(np.asarray(view1_points[gid], dtype=np.float32), axis=0)
+        xy = _to_canvas_xy(p1)
+        if xy is None:
+            continue
+        x, y = xy
+        col = (
+            int(gid * 37 % 255),
+            int(gid * 17 % 255),
+            int(gid * 97 % 255),
+        )
+        cv.drawMarker(
+            out, (x, y), col,
+            markerType=cv.MARKER_DIAMOND,
+            markerSize=11,
+            thickness=2
+        )
+        cv.putText(
+            out, f'V1:{gid}', (x + 7, y - 7),
+            cv.FONT_HERSHEY_SIMPLEX, 0.45, col, 1
+        )
+        only_view1_count += 1
+
+    only_view2_count = 0
+    for gid in only_view2_gids:
+        p2 = np.mean(np.asarray(view2_points[gid], dtype=np.float32), axis=0)
+        xy = _to_canvas_xy(p2)
+        if xy is None:
+            continue
+        x, y = xy
+        col = (
+            int(gid * 37 % 255),
+            int(gid * 17 % 255),
+            int(gid * 97 % 255),
+        )
+        cv.drawMarker(
+            out, (x, y), col,
+            markerType=cv.MARKER_SQUARE,
+            markerSize=11,
+            thickness=2
+        )
+        cv.putText(
+            out, f'V2:{gid}', (x + 7, y - 7),
+            cv.FONT_HERSHEY_SIMPLEX, 0.45, col, 1
+        )
+        only_view2_count += 1
+
+    overlay_scale = 0.45
     if frame_id is not None:
-        draw_text_with_bg(out, f'Frame {int(frame_id)}', (20, 35))
-    draw_text_with_bg(out, f'Shared tracks: {midpoint_count}', (20, 70), scale=0.55)
+        draw_text_with_bg(out, f'Frame {int(frame_id)}', (20, 35), scale=overlay_scale)
+    draw_text_with_bg(out, f'Shared tracks: {midpoint_count}', (20, 70), scale=overlay_scale)
+    draw_text_with_bg(out, f'V1-only tracks: {only_view1_count}', (20, 112), scale=overlay_scale)
+    draw_text_with_bg(out, f'V2-only tracks: {only_view2_count}', (20, 154), scale=overlay_scale)
     return out
 
 
@@ -490,19 +472,11 @@ def _augment_event_with_view_and_projected_pos(
     """Attach own-view bottom center and projected point in the other view."""
     event['view_x'] = ''
     event['view_y'] = ''
-    event['view_pos_json'] = ''
     event['projected_other_x'] = ''
     event['projected_other_y'] = ''
-    event['projected_other_pos_json'] = ''
     event['matched_with_other_view_track_id'] = ''
-    event['assoc_projected_other_x'] = ''
-    event['assoc_projected_other_y'] = ''
-    event['assoc_projected_other_pos_json'] = ''
-    event['has_assoc_projected_other_pos'] = 0
     event['assoc_native_other_x'] = ''
     event['assoc_native_other_y'] = ''
-    event['assoc_native_other_pos_json'] = ''
-    event['has_assoc_native_other_pos'] = 0
     event['assoc_match_dist_px'] = ''
 
     if tracker is None:
@@ -516,20 +490,11 @@ def _augment_event_with_view_and_projected_pos(
     if assoc is not None:
         if assoc.get('other_track_id') is not None:
             event['matched_with_other_view_track_id'] = int(assoc['other_track_id'])
-        proj_other = assoc.get('projected_other_pt')
-        if proj_other is not None and np.all(np.isfinite(proj_other)):
-            px, py = float(proj_other[0]), float(proj_other[1])
-            event['assoc_projected_other_x'] = px
-            event['assoc_projected_other_y'] = py
-            event['assoc_projected_other_pos_json'] = json.dumps([px, py])
-            event['has_assoc_projected_other_pos'] = 1
         native_other = assoc.get('native_other_pt')
         if native_other is not None and np.all(np.isfinite(native_other)):
             nx, ny = float(native_other[0]), float(native_other[1])
             event['assoc_native_other_x'] = nx
             event['assoc_native_other_y'] = ny
-            event['assoc_native_other_pos_json'] = json.dumps([nx, ny])
-            event['has_assoc_native_other_pos'] = 1
         if assoc.get('distance_px') is not None:
             event['assoc_match_dist_px'] = float(assoc['distance_px'])
 
@@ -547,7 +512,6 @@ def _augment_event_with_view_and_projected_pos(
         vx, vy = float(view_pt[0]), float(view_pt[1])
         event['view_x'] = vx
         event['view_y'] = vy
-        event['view_pos_json'] = json.dumps([vx, vy])
 
         if homography_to_other is not None:
             proj_pt = project_point_with_homography(view_pt, homography_to_other)
@@ -555,7 +519,6 @@ def _augment_event_with_view_and_projected_pos(
                 px, py = float(proj_pt[0]), float(proj_pt[1])
                 event['projected_other_x'] = px
                 event['projected_other_y'] = py
-                event['projected_other_pos_json'] = json.dumps([px, py])
     return event
 
 # ================= MAIN =================
@@ -855,11 +818,8 @@ def detect_view(frame, frame_id, annotations, det_model,
             d['keypoints'] = kpts
             d['pose_vec'] = vec
             d['pose_attempts_used'] = int(attempts_used)
-        elif d.get('pose_attempts_used') is not None:
-            try:
-                d['pose_attempts_used'] = int(d['pose_attempts_used'])
-            except (TypeError, ValueError):
-                d['pose_attempts_used'] = 0
+        else:
+            d['pose_attempts_used'] = int(d['pose_attempts_used'])
         # Map to a shared reference plane (or keep native bottom-center if no homography).
         if d.get('world_pos') is None:
             d['world_pos'] = _bbox_to_reference_plane(d['bbox'], world_homography)
@@ -870,8 +830,6 @@ def detect_view(frame, frame_id, annotations, det_model,
 def merge_track_global_id(tracker, track, target_gid, frame_id):
     if track['global_id'] == target_gid:
         return True
-    if not hasattr(tracker, 'reassign_track_global_id'):
-        return False
     return bool(
         tracker.reassign_track_global_id(
             track, target_gid, frame_id
@@ -887,8 +845,6 @@ def _bbox_to_reference_plane(bbox, homography_to_ref=None):
     pt = _bbox_bottom_center(bbox)
     if homography_to_ref is not None:
         pt = project_point_with_homography(pt, homography_to_ref)
-    if pt is None or not np.all(np.isfinite(pt)):
-        return None
     return np.array([float(pt[0]), float(pt[1]), 0.0], dtype=np.float32)
 
 # TO DO: maybe consider keeping the oldest GID in cross-view match when both are not refound, instead of keeping GID from view 1
@@ -947,13 +903,6 @@ def associate_tracks_to_view1(
     def _select_target_gid(t1, t2):
         gid1 = t1.get('global_id')
         gid2 = t2.get('global_id')
-
-        if gid1 is None and gid2 is None:
-            return None, False
-        if gid1 is None:
-            return gid2, True
-        if gid2 is None:
-            return gid1, True
         if gid1 == gid2:
             return gid1, False
 
@@ -1001,16 +950,7 @@ def associate_tracks_to_view1(
         if homography_other_to_anchor is not None and n2_pt is not None and np.all(np.isfinite(n2_pt)):
             p1 = project_point_with_homography(n2_pt, homography_other_to_anchor)
 
-        gid1_now = t1.get('global_id')
-        gid2_now = t2.get('global_id')
-        if gid1_now is None:
-            assoc_gid = gid2_now
-        elif gid2_now is None:
-            assoc_gid = gid1_now
-        elif gid1_now == gid2_now:
-            assoc_gid = gid1_now
-        else:
-            assoc_gid = None
+        assoc_gid = t1.get('global_id')
         associations.append({
             'track_id_view1': t1.get('track_id'),
             'track_id_view2': t2.get('track_id'),
@@ -1050,7 +990,7 @@ def yolo_sahi_pose_tracking(
     appearance_weight1=0.40,
     pose_weight1=0.25,
     ema_alpha1=0.5,
-    max_velocity1=35.0,
+    max_velocity1=12.0, #before wa 35
     cross_view_max_dist_px1=35.0,
     # detection View 2
     sahi_conf_threshold2=0.45,
@@ -1067,9 +1007,9 @@ def yolo_sahi_pose_tracking(
     appearance_weight2=0.35,
     pose_weight2=0.15,
     ema_alpha2=0.5,
-    max_velocity2=35.0,
+    max_velocity2=18.0, #before was 35.0
     homography_path='homography_cam4_to_cam13.json',
-    nested_overlap_thresh1=0.8,
+    nested_overlap_thresh1=0.71,
     nested_overlap_thresh2=0.8,
     # line-based filtering + debug
     invalid_view1_line_ids=(12, 13, 14),
@@ -1104,12 +1044,12 @@ def yolo_sahi_pose_tracking(
     print("Loading models...")
     det_model = AutoDetectionModel.from_pretrained(
         model_type='ultralytics',
-        model_path='yolo11x.pt',
+        model_path='yolo26x.pt',
         confidence_threshold=min(sahi_conf_threshold1, sahi_conf_threshold2),
         image_size=640,
         device='cuda:0'
     )
-    pose_model = YOLO('yolo11x-pose.pt')
+    pose_model = YOLO('yolo26x-pose.pt')
     print("Models loaded successfully")
 
     video_prefix1 = os.path.basename(source1).split('.')[0] if source1 else None
@@ -1198,10 +1138,9 @@ def yolo_sahi_pose_tracking(
             'matched_with_other_view_track_id', 'new_global_id', 'old_global_id',
             'swapped_with_track_id',
             'detections_in_frame',
-            'view_x', 'view_y', 'view_pos_json',
-            'projected_other_x', 'projected_other_y', 'projected_other_pos_json',
-            'assoc_projected_other_x', 'assoc_projected_other_y', 'assoc_projected_other_pos_json', 'has_assoc_projected_other_pos',
-            'assoc_native_other_x', 'assoc_native_other_y', 'assoc_native_other_pos_json', 'has_assoc_native_other_pos',
+            'view_x', 'view_y',
+            'projected_other_x', 'projected_other_y',
+            'assoc_native_other_x', 'assoc_native_other_y',
             'assoc_match_dist_px',
         ]
     )
@@ -1215,10 +1154,9 @@ def yolo_sahi_pose_tracking(
             'matched_with_other_view_track_id', 'new_global_id', 'old_global_id',
             'swapped_with_track_id',
             'detections_in_frame',
-            'view_x', 'view_y', 'view_pos_json',
-            'projected_other_x', 'projected_other_y', 'projected_other_pos_json',
-            'assoc_projected_other_x', 'assoc_projected_other_y', 'assoc_projected_other_pos_json', 'has_assoc_projected_other_pos',
-            'assoc_native_other_x', 'assoc_native_other_y', 'assoc_native_other_pos_json', 'has_assoc_native_other_pos',
+            'view_x', 'view_y',
+            'projected_other_x', 'projected_other_y',
+            'assoc_native_other_x', 'assoc_native_other_y',
             'assoc_match_dist_px',
         ]
     )
@@ -1483,10 +1421,10 @@ def yolo_sahi_pose_tracking(
         fps_hist.append(1 / dt if dt > 0 else 0)
         fps_avg = sum(fps_hist) / len(fps_hist) if fps_hist else 0
         
-        draw_text_with_bg(out1, f'FPS {int(fps_avg)}', (30, 50))
-        draw_text_with_bg(out1, f'Frame {frame_id}', (30, 100))
-        draw_text_with_bg(out2, f'FPS {int(fps_avg)}', (30, 50))
-        draw_text_with_bg(out2, f'Frame {frame_id}', (30, 100))
+        draw_text_with_bg(out1, f'FPS {int(fps_avg)}', (30, 50), scale=0.45)
+        draw_text_with_bg(out1, f'Frame {frame_id}', (30, 100), scale=0.45)
+        draw_text_with_bg(out2, f'FPS {int(fps_avg)}', (30, 50), scale=0.45)
+        draw_text_with_bg(out2, f'Frame {frame_id}', (30, 100), scale=0.45)
 
         writer1.write(out1)
         writer2.write(out2)
@@ -1502,13 +1440,9 @@ def yolo_sahi_pose_tracking(
             if court_frame is not None:
                 writer_court.write(court_frame)
 
-        disp1 = resize_for_display(out1, max_width=size[0], max_height=size[1])
-        disp2 = resize_for_display(out2, max_width=size[0], max_height=size[1])
-        cv.imshow('Tracking View 1', disp1)
-        cv.imshow('Tracking View 2', disp2)
-        
-        if cv.waitKey(1) & 0xFF == ord('q'):
-            break
+        cv.imshow('Tracking View 1', out1)
+        cv.imshow('Tracking View 2', out2)
+        cv.waitKey(1)
 
         frame_id += 1
 
@@ -1530,23 +1464,18 @@ def yolo_sahi_pose_tracking(
 
 
 if __name__ == '__main__':
-    try:
-        yolo_sahi_pose_tracking(
-            source1='Tracking/material4project/Rectified videos/tracking_12/out13.mp4',
-            source2='Tracking/material4project/Rectified videos/tracking_12/out4.mp4',
-            annotations_dir1='tracking_12.v4i.yolov11/train/labels/',
-            annotations_dir2='tracking_12.v4i.yolov11/train/labels/',
-            output_path1='output_view1.mp4',
-            output_path2='output_view2.mp4',
-            court_lines_path1='court_lines_cam13.json',
-            court_corners_path1='cam13_img_corners_rectified.json',
-            save_court_projection=True,
-            court_template_path='basketball_court_template_by_verasthebrujah_ddm06jb-fullview.png',
-            homography_view1_to_court_path='homography_cam13_to_court.json',
-            homography_view2_to_court_path='homography_cam4_to_court.json',
-            output_court_projection_path='output_court_projection.mp4',
-        )
-    except Exception as e:
-        print(f"Error during execution: {e}")
-        import traceback
-        traceback.print_exc()
+    yolo_sahi_pose_tracking(
+        source1='Tracking/material4project/Rectified videos/tracking_12/out13.mp4',
+        source2='Tracking/material4project/Rectified videos/tracking_12/out4.mp4',
+        annotations_dir1='tracking_12.v4i.yolov11/train/labels/',
+        annotations_dir2='tracking_12.v4i.yolov11/train/labels/',
+        output_path1='output_view1.mp4',
+        output_path2='output_view2.mp4',
+        court_lines_path1='court_lines_cam13.json',
+        court_corners_path1='cam13_img_corners_rectified.json',
+        save_court_projection=True,
+        court_template_path='basketball_court_template_by_verasthebrujah_ddm06jb-fullview.png',
+        homography_view1_to_court_path='homography_cam13_to_court.json',
+        homography_view2_to_court_path='homography_cam4_to_court.json',
+        output_court_projection_path='output_court_projection.mp4',
+    )

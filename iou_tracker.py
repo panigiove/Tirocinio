@@ -22,27 +22,19 @@ def iou(b1, b2):
 class GlobalIDManager:
     def __init__(self, pool_size=None, gid_values=None, cooldown_frames=90):
         self._active_counts = {}
-
-        # Fixed-pool mode when pool_size/gid_values are provided.
-        self._fixed_pool = (gid_values is not None) or (pool_size is not None)
-        if self._fixed_pool:
-            if gid_values is None:
-                gid_values = list(range(int(pool_size)))
-            gids = sorted({int(g) for g in gid_values})
-            if not gids:
-                raise ValueError("GlobalIDManager requires at least one GID in the pool")
-            for gid in gids:
-                self._active_counts[gid] = 0
-            self._gids = gids
-        else:
-            self._gids = []
+        if gid_values is None:
+            gid_values = list(range(int(pool_size)))
+        gids = sorted({int(g) for g in gid_values})
+        if not gids:
+            raise ValueError("GlobalIDManager requires at least one GID in the pool")
+        for gid in gids:
+            self._active_counts[gid] = 0
+        self._gids = gids
 
     def claim_id(self, gid, _frame_id=None):
         gid = int(gid)
         if gid not in self._active_counts:
-            if self._fixed_pool:
-                return False
-            self._active_counts[gid] = 0
+            return False
         self._active_counts[gid] += 1
         return True
 
@@ -59,6 +51,7 @@ class IOUTracker:
                  iou_weight=0.5,
                  appearance_weight=0.35,
                  pose_weight=0.15,
+                 pose_decay=1.13,
                  world_dist_weight=0.7,
                  ema_alpha=0.9,
                  max_tracks=None,
@@ -73,6 +66,7 @@ class IOUTracker:
             iou_weight (float): Weight for Intersection over Union (spatial overlap in 2D).
             appearance_weight (float): Weight for visual appearance similarity (cosine similarity).
             pose_weight (float): Weight for pose estimation similarity.
+            pose_decay (float): Decay factor k in exp(-k * d) for pose distance.
             world_dist_weight (float): Weight for Euclidean distance in 3D/world coordinates. 
                                      When available, this cue becomes dominant for tracking.
             ema_alpha (float): Momentum for Exponential Moving Average of appearance vectors.
@@ -84,6 +78,7 @@ class IOUTracker:
         self.iou_w = iou_weight
         self.app_w = appearance_weight
         self.pose_w = pose_weight
+        self.pose_decay = float(pose_decay)
         self.world_w = world_dist_weight
         self.ema_alpha = ema_alpha
         self.max_tracks = max_tracks
@@ -112,15 +107,13 @@ class IOUTracker:
             return 0.0
         return float(np.dot(a, b))  # cosine similarity (vectors are normalized)
 
-    @staticmethod
-    def _pose_sim(p1, p2):
+    def _pose_sim(self, p1, p2):
         if p1 is None or p2 is None:
             return 0.0
         # for pose, a smaller distance means higher similarity.
         # we can convert distance to similarity using an exponential decay.
         d = np.linalg.norm(p1 - p2)
-        # adjust the decay factor (e.g., 0.1) based on expected pose variations
-        return float(np.exp(-0.1 * d))
+        return float(np.exp(-self.pose_decay * d))
 
     def _pair_similarity(self, track, det):
         iou_score = iou(track['bbox'], det['bbox'])
@@ -133,45 +126,34 @@ class IOUTracker:
             non_spatial_sim = 0.0
         else:
             non_spatial_sim = (
-                self.iou_w / cue_norm * iou_score
-                + self.app_w / cue_norm * app_score
-                + self.pose_w / cue_norm * pose_score
+                self.iou_w * iou_score
+                + self.app_w * app_score
+                + self.pose_w * pose_score
             )
+            non_spatial_sim /= cue_norm
 
         track_wp = track.get('world_pos')
         det_wp = det.get('world_pos')
-        has_world = (track_wp is not None) and (det_wp is not None)
 
-        if has_world:
-            # Use only X,Y for distance (ignore Z which is always 0).
-            dist = np.linalg.norm(track_wp[:2] - det_wp[:2])
-            max_dist = self.max_velocity * (track['missed'] + 1)
-            w_spatial = self.world_w
-            w_other = (1.0 - w_spatial)
+        # Use only X,Y for distance (ignore Z which is always 0).
+        dist = np.linalg.norm(track_wp[:2] - det_wp[:2])
+        max_dist = self.max_velocity * (track['missed'] + 1)
+        w_spatial = self.world_w
+        w_other = (1.0 - w_spatial)
 
-            if dist > max_dist:
-                # Impossible jump: heavily penalize non-spatial cues.
-                sim = w_other * non_spatial_sim * 0.5
-            else:
-                spatial_sim = self._world_pos_sim(track_wp, det_wp, dist=dist)
-                sim = (w_spatial * spatial_sim + w_other * non_spatial_sim)
+        if dist > max_dist:
+            # Impossible jump: heavily penalize non-spatial cues.
+            sim = w_other * non_spatial_sim * 0.5
         else:
-            # Fallback when spatial information is unavailable.
-            sim = non_spatial_sim
+            spatial_sim = self._world_pos_sim(track_wp, det_wp, dist=dist)
+            sim = (w_spatial * spatial_sim + w_other * non_spatial_sim)
 
         return float(sim)
 
-    def _cost_matrix(self, detections, track_indices=None, det_indices=None):
-        if track_indices is None:
-            track_indices = list(range(len(self.tracks)))
-        if det_indices is None:
-            det_indices = list(range(len(detections)))
-
+    def _cost_matrix(self, detections, track_indices, det_indices):
         n_t = len(track_indices)
         n_d = len(det_indices)
         cost = np.zeros((n_t, n_d), dtype=np.float32)
-        if n_t == 0 or n_d == 0:
-            return cost
 
         for row_i, track_idx in enumerate(track_indices):
             track = self.tracks[track_idx]
@@ -229,8 +211,6 @@ class IOUTracker:
         Returns:
             float: Similarity score in range [0, 1].
         """
-        if wp1 is None or wp2 is None:
-            return 0.0
         # Use pre-calculated distance if available
         if dist is None:
             # Use only X,Y for distance
@@ -245,28 +225,15 @@ class IOUTracker:
         Start a new track. If a target global_id is provided and already present
         in this view, update that track slot (used for first-frame annotation bootstrap).
         """
-        # If global_id is provided, try to update that specific existing track first.
-        if global_id is not None:
-            if global_id in self.global_id_to_track:
-                existing_track = self.global_id_to_track[global_id]
-                # If it's already updated, we can't update it again in this frame.
-                if existing_track['updated']:
-                    return None
-                self._update_track(existing_track, det, frame_id)
-                existing_track['updated'] = True
-                return existing_track
-
         # Strict slot cap: never exceed max_tracks.
         if self.max_tracks is not None:
             if len(self.tracks) >= self.max_tracks:
                 return None
 
         # In this pipeline tracks are bootstrapped from annotated IDs.
-        if global_id is None:
-            return None
         global_id = int(global_id)
         if not self.id_manager.claim_id(global_id, frame_id):
-            return None
+            raise ValueError(f"Could not claim global_id={global_id} at frame={frame_id}")
             
         new_track = {
             'track_id': self.next_id,
@@ -295,16 +262,9 @@ class IOUTracker:
         return new_track
 
     def _find_track_by_gid(self, gid, exclude_track=None):
-        if gid is None:
-            return None
         t = self.global_id_to_track.get(gid)
         if t is not None and t is not exclude_track and t in self.tracks:
             return t
-        for cand in self.tracks:
-            if cand is exclude_track:
-                continue
-            if cand.get('global_id') == gid:
-                return cand
         return None
 
     def reassign_track_global_id(
@@ -326,59 +286,31 @@ class IOUTracker:
         tid = track.get('track_id')
         new_gid = int(new_gid)
 
-        if old_gid == new_gid:
-            if tid is not None:
-                self.track_to_global_id[tid] = new_gid
-            self.global_id_to_track[new_gid] = track
-            return True
-
         occupied = self._find_track_by_gid(new_gid, exclude_track=track)
-        if occupied is not None:
-            # In fixed-slot settings we often want GIDs to follow the cross-view
-            # association result, even if the target GID is currently occupied.
-            # Resolve this by swapping GIDs between the two tracks.
-            occupied_tid = occupied.get('track_id')
-            occupied_gid = occupied.get('global_id')
+        if occupied is None:
+            raise RuntimeError(
+                f"Expected occupied GID slot for reassignment to {new_gid} at frame {frame_id}"
+            )
 
-            track['global_id'] = new_gid
-            if tid is not None:
-                self.track_to_global_id[tid] = new_gid
-            self.global_id_to_track[new_gid] = track
-
-            if occupied_gid is not None:
-                occupied['global_id'] = old_gid
-                if occupied_tid is not None:
-                    self.track_to_global_id[occupied_tid] = old_gid
-                if old_gid is not None:
-                    self.global_id_to_track[old_gid] = occupied
-
-            self.current_frame_events.append({
-                'frame': frame_id,
-                'track_id': tid,
-                'event': event_name,
-                'old_global_id': old_gid,
-                'new_global_id': new_gid,
-                'swapped_with_track_id': occupied_tid
-            })
-            return True
-
-        if not self.id_manager.claim_id(new_gid, frame_id):
-            return False
-
-        if old_gid in self.global_id_to_track and self.global_id_to_track[old_gid] is track:
-            del self.global_id_to_track[old_gid]
+        # In fixed-slot settings we want GIDs to follow cross-view association.
+        occupied_tid = occupied.get('track_id')
+        occupied_gid = occupied.get('global_id')
 
         track['global_id'] = new_gid
-        if tid is not None:
-            self.track_to_global_id[tid] = new_gid
+        self.track_to_global_id[tid] = new_gid
         self.global_id_to_track[new_gid] = track
+
+        occupied['global_id'] = old_gid
+        self.track_to_global_id[occupied_tid] = old_gid
+        self.global_id_to_track[old_gid] = occupied
 
         self.current_frame_events.append({
             'frame': frame_id,
             'track_id': tid,
             'event': event_name,
             'old_global_id': old_gid,
-            'new_global_id': new_gid
+            'new_global_id': new_gid,
+            'swapped_with_track_id': occupied_tid
         })
         return True
 
@@ -401,18 +333,15 @@ class IOUTracker:
         track['world_pos'] = det.get('world_pos')
 
         # EMA update for appearance
-        if track.get('appearance') is not None and det.get('appearance') is not None:
-            updated_app = (
-                self.ema_alpha * track['appearance'] +
-                (1.0 - self.ema_alpha) * det['appearance']
-            )
-            # Re-normalize to maintain unit vector for cosine similarity
-            norm = np.linalg.norm(updated_app)
-            if norm > 0:
-                updated_app /= norm
-            track['appearance'] = updated_app
-        else:
-            track['appearance'] = det.get('appearance')
+        updated_app = (
+            self.ema_alpha * track['appearance'] +
+            (1.0 - self.ema_alpha) * det['appearance']
+        )
+        # Re-normalize to maintain unit vector for cosine similarity
+        norm = np.linalg.norm(updated_app)
+        if norm > 0:
+            updated_app /= norm
+        track['appearance'] = updated_app
 
         track['missed'] = 0
         track['updated'] = True
@@ -446,22 +375,6 @@ class IOUTracker:
         for t in self.tracks:
             t['updated'] = False
             t['was_refound_in_this_frame'] = False
-
-        if len(detections) == 0:
-            for t in self.tracks:
-                t['missed'] += 1
-                if t['missed'] > 0:
-                    self.current_frame_events.append({
-                        'frame': frame_id, 
-                        'track_id': t['track_id'], 
-                        'event': 'temporary_missed', 
-                        'global_id': t['global_id']
-                    })
-                    self.current_frame_statistics['temporary_missed_tracks'] += 1
-                    self.total_temporary_missed_frames += 1
-            self.current_frame_statistics['active_tracks'] = len(self.tracks)
-            self.total_active_tracks = len(self.tracks)
-            return self.tracks, [], detections
 
         all_det_indices = list(range(len(detections)))
         active_track_indices = [i for i, t in enumerate(self.tracks) if t.get('missed', 0) == 0]
