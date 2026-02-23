@@ -272,7 +272,7 @@ class IOUTracker:
         track,
         new_gid,
         frame_id,
-        event_name='merged_id',
+        event_name='gid_swap',
     ):
         """
         Reassign a specific track to a new global ID.

@@ -462,64 +462,77 @@ def _build_association_lookup(associations):
     return by_view1_track, by_view2_track
 
 
-def _augment_event_with_view_and_projected_pos(
+def _build_event_log_row(
     event,
     tracker,
-    homography_to_other,
     association_info_by_track=None,
     track_by_id=None,
 ):
-    """Attach own-view bottom center and projected point in the other view."""
-    event['view_x'] = ''
-    event['view_y'] = ''
-    event['projected_other_x'] = ''
-    event['projected_other_y'] = ''
-    event['matched_with_other_view_track_id'] = ''
-    event['assoc_native_other_x'] = ''
-    event['assoc_native_other_y'] = ''
-    event['assoc_match_dist_px'] = ''
+    """
+    Build a minimal event-log row.
 
-    if tracker is None:
-        return event
+    Columns requested:
+      frame, gid, event, new_gid, old_gid, matched_other_view, track_(x,y), assoc_(x,y)
+    """
+    row = {
+        'frame': '',
+        'gid': '',
+        'event': '',
+        'new_gid': '',
+        'old_gid': '',
+        'matched_other_view': 0,
+        'track_x': '',
+        'track_y': '',
+        'assoc_x': '',
+        'assoc_y': '',
+    }
+
+    if event is None:
+        return row
+
+    if event.get('frame') is not None:
+        row['frame'] = int(event['frame'])
+    if event.get('event') is not None:
+        row['event'] = str(event['event'])
+
+    if event.get('new_global_id') is not None:
+        row['new_gid'] = int(event['new_global_id'])
+    if event.get('old_global_id') is not None:
+        row['old_gid'] = int(event['old_global_id'])
 
     tid = event.get('track_id')
-    if tid is None:
-        return event
-
-    assoc = (association_info_by_track or {}).get(tid)
-    if assoc is not None:
-        if assoc.get('other_track_id') is not None:
-            event['matched_with_other_view_track_id'] = int(assoc['other_track_id'])
+    assoc = (association_info_by_track or {}).get(tid) if tid is not None else None
+    if assoc is not None and assoc.get('other_track_id') is not None:
+        row['matched_other_view'] = 1
         native_other = assoc.get('native_other_pt')
         if native_other is not None and np.all(np.isfinite(native_other)):
-            nx, ny = float(native_other[0]), float(native_other[1])
-            event['assoc_native_other_x'] = nx
-            event['assoc_native_other_y'] = ny
-        if assoc.get('distance_px') is not None:
-            event['assoc_match_dist_px'] = float(assoc['distance_px'])
+            row['assoc_x'] = float(native_other[0])
+            row['assoc_y'] = float(native_other[1])
 
     track = None
-    if track_by_id is not None:
+    if tid is not None and track_by_id is not None:
         track = track_by_id.get(tid)
-    if track is None:
+    if track is None and tid is not None and tracker is not None:
         track = next((t for t in tracker.tracks if t.get('track_id') == tid), None)
+
+    gid = None
+    if track is not None:
+        gid = track.get('global_id')
+    if gid is None:
+        gid = event.get('global_id')
+    if gid is None:
+        gid = event.get('new_global_id')
+    if gid is not None:
+        row['gid'] = int(gid)
+
     bbox = track.get('bbox') if track else None
-    if bbox is None:
-        return event
+    if bbox is not None:
+        view_pt = _bbox_bottom_center(bbox)
+        if np.all(np.isfinite(view_pt)):
+            row['track_x'] = float(view_pt[0])
+            row['track_y'] = float(view_pt[1])
 
-    view_pt = _bbox_bottom_center(bbox)
-    if np.all(np.isfinite(view_pt)):
-        vx, vy = float(view_pt[0]), float(view_pt[1])
-        event['view_x'] = vx
-        event['view_y'] = vy
-
-        if homography_to_other is not None:
-            proj_pt = project_point_with_homography(view_pt, homography_to_other)
-            if np.all(np.isfinite(proj_pt)):
-                px, py = float(proj_pt[0]), float(proj_pt[1])
-                event['projected_other_x'] = px
-                event['projected_other_y'] = py
-    return event
+    return row
 
 # ================= MAIN =================
 
@@ -1134,14 +1147,16 @@ def yolo_sahi_pose_tracking(
     csv_writer1 = csv.DictWriter(
         csv_file1,
         fieldnames=[
-            'frame', 'track_id', 'event', 'global_id',
-            'matched_with_other_view_track_id', 'new_global_id', 'old_global_id',
-            'swapped_with_track_id',
-            'detections_in_frame',
-            'view_x', 'view_y',
-            'projected_other_x', 'projected_other_y',
-            'assoc_native_other_x', 'assoc_native_other_y',
-            'assoc_match_dist_px',
+            'frame',
+            'gid',
+            'event',
+            'new_gid',
+            'old_gid',
+            'matched_other_view',
+            'track_x',
+            'track_y',
+            'assoc_x',
+            'assoc_y',
         ]
     )
     csv_writer1.writeheader()
@@ -1150,14 +1165,16 @@ def yolo_sahi_pose_tracking(
     csv_writer2 = csv.DictWriter(
         csv_file2,
         fieldnames=[
-            'frame', 'track_id', 'event', 'global_id',
-            'matched_with_other_view_track_id', 'new_global_id', 'old_global_id',
-            'swapped_with_track_id',
-            'detections_in_frame',
-            'view_x', 'view_y',
-            'projected_other_x', 'projected_other_y',
-            'assoc_native_other_x', 'assoc_native_other_y',
-            'assoc_match_dist_px',
+            'frame',
+            'gid',
+            'event',
+            'new_gid',
+            'old_gid',
+            'matched_other_view',
+            'track_x',
+            'track_y',
+            'assoc_x',
+            'assoc_y',
         ]
     )
     csv_writer2.writeheader()
@@ -1297,21 +1314,19 @@ def yolo_sahi_pose_tracking(
     track_map1 = {t.get('track_id'): t for t in tracker1.tracks if t.get('track_id') is not None}
     track_map2 = {t.get('track_id'): t for t in tracker2.tracks if t.get('track_id') is not None}
     for event in tracker1.get_frame_events():
-        event['detections_in_frame'] = len(initial_detections1)
-        _augment_event_with_view_and_projected_pos(
-            event, tracker1, h_view1_to_view2,
+        row = _build_event_log_row(
+            event, tracker1,
             association_info_by_track=assoc_lookup_view1,
             track_by_id=track_map1,
         )
-        csv_writer1.writerow(event)
+        csv_writer1.writerow(row)
     for event in tracker2.get_frame_events():
-        event['detections_in_frame'] = len(initial_detections2)
-        _augment_event_with_view_and_projected_pos(
-            event, tracker2, h_view2_to_view1,
+        row = _build_event_log_row(
+            event, tracker2,
             association_info_by_track=assoc_lookup_view2,
             track_by_id=track_map2,
         )
-        csv_writer2.writerow(event)
+        csv_writer2.writerow(row)
 
     # Save first frame
     roi1 = frame1
@@ -1388,22 +1403,20 @@ def yolo_sahi_pose_tracking(
         track_map1 = {t.get('track_id'): t for t in tracker1.tracks if t.get('track_id') is not None}
         track_map2 = {t.get('track_id'): t for t in tracker2.tracks if t.get('track_id') is not None}
         for event in tracker1.get_frame_events():
-            event['detections_in_frame'] = len(detections1)
-            _augment_event_with_view_and_projected_pos(
-                event, tracker1, h_view1_to_view2,
+            row = _build_event_log_row(
+                event, tracker1,
                 association_info_by_track=assoc_lookup_view1,
                 track_by_id=track_map1,
             )
-            csv_writer1.writerow(event)
+            csv_writer1.writerow(row)
         
         for event in tracker2.get_frame_events():
-            event['detections_in_frame'] = len(detections2)
-            _augment_event_with_view_and_projected_pos(
-                event, tracker2, h_view2_to_view1,
+            row = _build_event_log_row(
+                event, tracker2,
                 association_info_by_track=assoc_lookup_view2,
                 track_by_id=track_map2,
             )
-            csv_writer2.writerow(event)
+            csv_writer2.writerow(row)
 
         # Refresh tracks after all operations
         tracks1 = tracker1.tracks
@@ -1442,7 +1455,10 @@ def yolo_sahi_pose_tracking(
 
         cv.imshow('Tracking View 1', out1)
         cv.imshow('Tracking View 2', out2)
-        cv.waitKey(1)
+        key = cv.waitKey(1) & 0xFF
+        if key in (ord('q'), ord('Q')):
+            print("Quit requested (q). Stopping processing...")
+            break
 
         frame_id += 1
 
